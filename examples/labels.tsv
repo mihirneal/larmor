@@ -1,0 +1,28 @@
+# labels.tsv for `larmor probe fit`: one row per scan, tab-separated, like a BIDS participants.tsv.
+# Lines starting with '#' are comments; larmor skips them (and blank lines).
+#
+# scan    path to the scan, relative to this file (absolute paths also work). Required.
+# fold    optional: a 0-based outer cross-validation fold per row. Leave the column out to get the
+#         eval framework's folds (KFold(5, shuffle, seed 0) for regression and segmentation,
+#         StratifiedKFold(5, shuffle, seed 0) for classification). Fold ids left without rows (all
+#         their labels missing) are closed up: 0, 2, 3 become 0, 1, 2.
+# others  label columns; pick one with --label. Empty cells and n/a are missing: rows without the
+#         chosen label are left out of that fit.
+#
+#   larmor probe fit examples/labels.tsv --model nanobrain-vits-p8 --kind regression --label age --out age.toml
+#   larmor probe fit examples/labels.tsv --model nanobrain-vits-p8 --kind classification --label group --out group.toml
+#   larmor probe fit examples/labels.tsv --model nanobrain-vits-p8 --kind segmentation --label lesion --out lesion.toml
+#
+# regression      numbers (age).
+# classification  exactly two values; numbers sort numerically, text alphabetically, and the second is
+#                 the positive class (here: patient, the probability apply reports).
+# segmentation    a binary (0/1) NIfTI per scan in the scan's own space (any grid: it is resampled onto
+#                 the model grid with nearest neighbour, as eval/prepare.py does for segs).
+#
+# The header row is the first line that is not a comment.
+scan	age	group	lesion	fold
+sub-01/anat/sub-01_T1w.nii.gz	34.5	control	sub-01/anat/sub-01_desc-lesion_mask.nii.gz	0
+sub-02/anat/sub-02_T1w.nii.gz	61	patient	sub-02/anat/sub-02_desc-lesion_mask.nii.gz	1
+sub-03/ses-1/anat/sub-03_ses-1_T1w.nii.gz	47.2	control	n/a	2
+sub-04/anat/sub-04_T1w.nii.gz	n/a	patient	sub-04/anat/sub-04_desc-lesion_mask.nii.gz	3
+sub-05/anat/sub-05_T1w.nii.gz	72	patient	sub-05/anat/sub-05_desc-lesion_mask.nii.gz	4
