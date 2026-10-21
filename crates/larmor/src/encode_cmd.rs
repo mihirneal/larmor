@@ -55,25 +55,41 @@ pub fn cmd_encode(options: EncodeOptions) -> Result<()> {
         dim(&cache_root.display().to_string())
     );
     let mut pipeline = Pipeline::new(&model, options.device, options.precision, cache_root);
-    pipeline.force = options.force;
+    pipeline.stager.force = options.force;
+    let stager = pipeline.stager.clone();
 
     let (mut encoded, mut cached, mut failed) = (0, 0, 0);
-    for (scan, (root, outputs)) in scans.iter().zip(&destinations) {
-        let name = outputs.stem.clone();
-        match encode_scan(&mut pipeline, scan, root, outputs, options.save_preprocessed) {
-            Ok(result) => {
-                println!("{}", status_line(&name, &result));
-                match result.outcome {
-                    Outcome::Encoded => encoded += 1,
-                    Outcome::Cached => cached += 1,
+    std::thread::scope(|scope| {
+        // a worker reads and preprocesses the next scan while the encoder works on this one
+        let (sender, staged_scans) = std::sync::mpsc::sync_channel(1);
+        let all = &scans;
+        scope.spawn(move || {
+            for scan in all {
+                if sender.send(stager.stage(scan, false)).is_err() {
+                    break;
                 }
             }
-            Err(err) => {
-                println!("  {} {name}  {err:#}", red("failed "));
-                failed += 1;
+        });
+        for ((scan, (root, outputs)), staged) in scans.iter().zip(&destinations).zip(staged_scans) {
+            let result = staged.and_then(|staged| pipeline.finish(staged, false)).and_then(|result| {
+                write_outputs(pipeline.model(), scan, root, outputs, &result, options.save_preprocessed)?;
+                Ok(result)
+            });
+            match result {
+                Ok(result) => {
+                    println!("{}", status_line(&outputs.stem, &result));
+                    match result.outcome {
+                        Outcome::Encoded => encoded += 1,
+                        Outcome::Cached => cached += 1,
+                    }
+                }
+                Err(err) => {
+                    println!("  {} {}  {err:#}", red("failed "), outputs.stem);
+                    failed += 1;
+                }
             }
         }
-    }
+    });
 
     let roots: Vec<String> = {
         let mut roots: Vec<String> =
@@ -96,16 +112,17 @@ pub fn cmd_encode(options: EncodeOptions) -> Result<()> {
     Ok(())
 }
 
-/// One scan: the embedding through the cache, then its derivatives.
-fn encode_scan(
-    pipeline: &mut Pipeline,
+/// One scan's derivatives: the pooled embedding, run.json and, with `--save-preprocessed`, the
+/// grid image and mask.
+fn write_outputs(
+    model: &Model,
     scan: &Path,
     root: &Path,
     outputs: &ScanOutputs,
+    result: &ScanResult,
     save_preprocessed: bool,
-) -> Result<ScanResult> {
-    let result = pipeline.run(scan, false)?;
-    let model_id = pipeline.model.id();
+) -> Result<()> {
+    let model_id = model.id();
     outputs.create_dir()?;
     outputs::ensure_dataset_description(root)?;
     let pooled = &result.entry.pooled;
@@ -119,10 +136,10 @@ fn encode_scan(
     if save_preprocessed {
         match &result.prepared {
             Some(prepared) => write_preprocessed(prepared, outputs, model_id)?,
-            None => write_preprocessed(&prepare_again(pipeline.model, scan)?.1, outputs, model_id)?,
+            None => write_preprocessed(&prepare_again(model, scan)?.1, outputs, model_id)?,
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Reads a scan whose embedding came from the cache and runs the recipe on it again (about 0.1 s).

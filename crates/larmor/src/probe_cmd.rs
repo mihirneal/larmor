@@ -402,7 +402,7 @@ fn apply_segmentation(
 
         let (nifti, prepared) = match (nifti, prepared) {
             (Some(nifti), Some(prepared)) => (nifti, prepared),
-            _ => prepare_again(pipeline.model, scan)?,
+            _ => prepare_again(pipeline.model(), scan)?,
         };
         if prepared.fit_affine.0 != grid.fit_affine {
             eprintln!("{} {}: the grid differs from the cached one", yellow("warning:"), scan.display());

@@ -231,12 +231,15 @@ fn check_scan_inner(
                 encode.tokens, encode.reference_tokens
             )
         });
-        report.gate(encode.min_cosine >= MIN_COSINE, || {
-            format!("{id}: min token cosine {:.6}", encode.min_cosine)
-        });
-        report.gate(encode.pooled_cosine >= MIN_COSINE, || {
-            format!("{id}: pooled cosine {:.6}", encode.pooled_cosine)
-        });
+        // tokens on different grids cannot be compared one to one
+        if encode.coords_equal {
+            report.gate(encode.min_cosine >= MIN_COSINE, || {
+                format!("{id}: min token cosine {:.6}", encode.min_cosine)
+            });
+            report.gate(encode.pooled_cosine >= MIN_COSINE, || {
+                format!("{id}: pooled cosine {:.6}", encode.pooled_cosine)
+            });
+        }
         report.encodes.push(encode);
     }
     Ok(())

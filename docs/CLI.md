@@ -52,7 +52,8 @@ folders, `derivatives/`, and label images (BIDS suffixes `_mask`, `_dseg`, `_pro
 For each scan: SHA-256 of the file bytes, then the cache key (scan SHA-256, preprocessing version, model
 weights SHA-256). On a cache hit nothing is computed; on a miss the scan is read, preprocessed with the
 model's recipe, cut into in-mask patch tokens, encoded and cached. The encoder is loaded only when some
-scan is not cached. One status line per scan, then a summary:
+scan is not cached, and while it encodes one scan the next is read and preprocessed on another thread.
+One status line per scan, then a summary:
 
 ```text
 larmor encode  2 scans · model nanobrain-vits-p8 (98562bb2) · cache ~/Library/Caches/larmor
@@ -220,5 +221,5 @@ Per-stage timing on this machine, like `onset timing-test`.
 
 Prints the chip, cores (performance and efficiency), GPU cores, memory and OS; the encoder load time and
 first (cold) encode; then median, min and max seconds for read, hash, mask, conform, quantize, normalize,
-tokens, warm encode, cache write and the warm total; and the load average and GPU utilization before and
-after, so timings taken on a busy machine can be recognized.
+tokens, warm encode, cache write and the warm total; and the load average and GPU utilization just
+before the timing started, so timings taken on a busy machine can be recognized.

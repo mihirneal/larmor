@@ -41,8 +41,8 @@ struct StageTiming {
 struct BenchReport {
     larmor_version: &'static str,
     machine: Machine,
-    load_before: Load,
-    load_after: Load,
+    /// How busy the machine was just before the timing started (other processes, not this one).
+    load: Load,
     model: String,
     model_source: String,
     scan: String,
@@ -67,7 +67,7 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
     let scratch = scratch_dir.path();
     let (model, model_source) = choose_model(options.model.as_deref(), scratch)?;
     let (scan, scan_source) = choose_scan(options.scan.as_deref(), scratch)?;
-    let load_before = Load::now();
+    let load = Load::now();
     let start = Instant::now();
     let (encoder, device) = load_encoder(&model, options.device, options.precision)?;
     let encoder_load_seconds = start.elapsed().as_secs_f64();
@@ -136,7 +136,6 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
     if progress {
         eprint!("\r\x1b[2K");
     }
-    let load_after = Load::now();
 
     // the first run's encode is the cold one; the warm statistics leave it out
     let warm = &runs[1..];
@@ -160,8 +159,7 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
     let report = BenchReport {
         larmor_version: env!("CARGO_PKG_VERSION"),
         machine,
-        load_before,
-        load_after,
+        load,
         model: model.id().to_string(),
         model_source,
         scan: scan.display().to_string(),
@@ -199,10 +197,7 @@ fn print_report(report: &BenchReport) {
         let line = format!("{:<14} {:>10} {:>10} {:>10}", s.stage, secs(s.median), secs(s.min), secs(s.max));
         if s.stage.starts_with("total") { println!("  {}", bold(&line)) } else { println!("  {line}") }
     }
-    println!(
-        "  {}",
-        dim(&format!("before: {} · after: {}", report.load_before.describe(), report.load_after.describe()))
-    );
+    println!("  {}", dim(&format!("machine load when the timing started: {}", report.load.describe())));
 }
 
 fn median(sorted: &[f64]) -> f64 {
