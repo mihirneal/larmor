@@ -3773,14 +3773,22 @@ name = "larmor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "dirs",
+ "half",
  "larmor-model",
  "larmor-prep",
  "larmor-probe",
  "larmor-volume",
+ "rayon",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
  "toml",
+ "ureq 3.5.0",
 ]
 
 [[package]]
@@ -6642,6 +6650,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64 0.23.1",
+ "flate2",
  "log",
  "percent-encoding",
  "rustls",
