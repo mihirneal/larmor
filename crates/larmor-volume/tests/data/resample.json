@@ -1,0 +1,155 @@
+{
+ "at_downsample": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   9,
+   8,
+   7
+  ]
+ },
+ "at_edge_beyond": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   5,
+   4,
+   3
+  ]
+ },
+ "at_edge_exact": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   7,
+   6,
+   5
+  ]
+ },
+ "at_edge_nearest": {
+  "kind": "affine_transform",
+  "order": 0,
+  "out_shape": [
+   5,
+   4,
+   3
+  ]
+ },
+ "at_half_ties": {
+  "kind": "affine_transform",
+  "order": 0,
+  "out_shape": [
+   11,
+   11,
+   11
+  ]
+ },
+ "at_int32_order0": {
+  "kind": "affine_transform",
+  "order": 0,
+  "out_shape": [
+   5,
+   4,
+   6
+  ]
+ },
+ "at_length_one_axis": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   1,
+   5,
+   4
+  ]
+ },
+ "at_oblique_linear_f64": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   10,
+   12,
+   8
+  ]
+ },
+ "at_oblique_nearest_u8": {
+  "kind": "affine_transform",
+  "order": 0,
+  "out_shape": [
+   10,
+   12,
+   8
+  ]
+ },
+ "at_oblique_round_i16": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   10,
+   12,
+   8
+  ]
+ },
+ "at_round_u16": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   9,
+   8,
+   6
+  ]
+ },
+ "at_round_u8": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   10,
+   12,
+   8
+  ]
+ },
+ "at_shift_int": {
+  "kind": "affine_transform",
+  "order": 1,
+  "out_shape": [
+   12,
+   10,
+   11
+  ]
+ },
+ "rft_mask_nearest": {
+  "kind": "resample_from_to",
+  "order": 0,
+  "to_shape": [
+   19,
+   23,
+   17
+  ]
+ },
+ "rft_oblique_to_1mm": {
+  "kind": "resample_from_to",
+  "order": 1,
+  "to_shape": [
+   12,
+   13,
+   11
+  ]
+ },
+ "rft_same_grid_keeps_zooms": {
+  "kind": "resample_from_to",
+  "order": 1,
+  "to_shape": [
+   10,
+   12,
+   9
+  ]
+ },
+ "v2o_lps_oblique": {
+  "kind": "vox2out_vox"
+ },
+ "v2o_psr_aniso": {
+  "kind": "vox2out_vox"
+ },
+ "v2o_ras_1mm": {
+  "kind": "vox2out_vox"
+ }
+}

@@ -5,7 +5,33 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# On Linux build with `--no-default-features --features flex,cuda,fusion,autotune`.
+default = ["flex", "metal", "fusion", "autotune"]
+# CPU backend (pure Rust, multithreaded, SIMD); also what the tests run on.
+flex = ["burn/flex", "burn/rayon", "burn/simd"]
+# Apple GPUs: wgpu runtime with kernels compiled to native MSL.
+metal = ["burn/metal"]
+# Any GPU through wgpu's portable WGSL path (slower than `metal` on a Mac).
+wgpu = ["burn/wgpu"]
+# NVIDIA GPUs; builds without CUDA installed, needs the driver at run time.
+cuda = ["burn/cuda"]
+# Fuse elementwise chains and reductions into fewer GPU kernels.
+fusion = ["burn/fusion"]
+# Benchmark kernel variants on first use of each shape; needed for GPU flash attention.
+autotune = ["burn/autotune"]
+# Keep autotune results on disk between runs (cubecl's cache directory).
+persistence = ["burn/persistence"]
+
 [dependencies]
-anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+toml.workspace = true
+safetensors.workspace = true
+burn.workspace = true
+sha2 = "0.11.0"
+
+[dev-dependencies]
+anyhow.workspace = true
+clap = { version = "4.6.7", features = ["derive", "env"] }
+libc = "0.2.191"

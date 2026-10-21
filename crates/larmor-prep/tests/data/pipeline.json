@@ -1,0 +1,50 @@
+{
+ "oblique_scaled_int16": {
+  "dtype": "int16",
+  "fov": [
+   24.0,
+   32.0,
+   24.0
+  ],
+  "orientation": "LPS",
+  "patch": 4,
+  "tokens": 254,
+  "zooms": [
+   1.100000023841858,
+   0.8999999761581421,
+   1.2999999523162842
+  ]
+ },
+ "pil_float32": {
+  "dtype": "float32",
+  "fov": [
+   24.0,
+   32.0,
+   24.0
+  ],
+  "orientation": "PIL",
+  "patch": 4,
+  "tokens": 203,
+  "zooms": [
+   1.5,
+   1.5,
+   1.5
+  ]
+ },
+ "ras_fine_uint8": {
+  "dtype": "uint8",
+  "fov": [
+   24.0,
+   32.0,
+   24.0
+  ],
+  "orientation": "RAS",
+  "patch": 4,
+  "tokens": 227,
+  "zooms": [
+   0.800000011920929,
+   0.800000011920929,
+   0.800000011920929
+  ]
+ }
+}

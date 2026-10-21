@@ -1,0 +1,46 @@
+{
+ "o_asl": {
+  "axcodes": "ASL",
+  "kind": "orientation"
+ },
+ "o_exact45": {
+  "axcodes": "RAS",
+  "kind": "orientation"
+ },
+ "o_las": {
+  "axcodes": "LAS",
+  "kind": "orientation"
+ },
+ "o_lps": {
+  "axcodes": "LPS",
+  "kind": "orientation"
+ },
+ "o_near45": {
+  "axcodes": "RAS",
+  "kind": "orientation"
+ },
+ "o_oblique10": {
+  "axcodes": "RAS",
+  "kind": "orientation"
+ },
+ "o_oblique30_flipped": {
+  "axcodes": "LAI",
+  "kind": "orientation"
+ },
+ "o_pil": {
+  "axcodes": "PIL",
+  "kind": "orientation"
+ },
+ "o_ras": {
+  "axcodes": "RAS",
+  "kind": "orientation"
+ },
+ "o_sheared": {
+  "axcodes": "RAS",
+  "kind": "orientation"
+ },
+ "o_tie_columns": {
+  "axcodes": "RAS",
+  "kind": "orientation"
+ }
+}

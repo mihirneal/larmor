@@ -1,0 +1,57 @@
+{
+ "g_nearest_mixed": {
+  "kind": "gaussian",
+  "mode": "nearest",
+  "sigma_dtype": "float64"
+ },
+ "g_short_lines": {
+  "kind": "gaussian",
+  "mode": "reflect",
+  "sigma_dtype": "float32"
+ },
+ "g_single_voxel_axis": {
+  "kind": "gaussian",
+  "mode": "reflect",
+  "sigma_dtype": "float32"
+ },
+ "g_smooth_like": {
+  "kind": "gaussian",
+  "mode": "nearest",
+  "sigma_dtype": "float64"
+ },
+ "g_threshold": {
+  "kind": "gaussian",
+  "mode": "reflect",
+  "sigma_dtype": "float32"
+ },
+ "g_tiny_sigma": {
+  "kind": "gaussian",
+  "mode": "nearest",
+  "sigma_dtype": "float64"
+ },
+ "k_f32_2": {
+  "dtype": "float32",
+  "kind": "kernel",
+  "radius": 8
+ },
+ "k_f32_8over3": {
+  "dtype": "float32",
+  "kind": "kernel",
+  "radius": 11
+ },
+ "k_f64_0p6164": {
+  "dtype": "float64",
+  "kind": "kernel",
+  "radius": 2
+ },
+ "k_f64_1p3": {
+  "dtype": "float64",
+  "kind": "kernel",
+  "radius": 5
+ },
+ "k_f64_tiny": {
+  "dtype": "float64",
+  "kind": "kernel",
+  "radius": 0
+ }
+}

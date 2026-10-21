@@ -1,0 +1,122 @@
+{
+ "a0": {
+  "kind": "affine"
+ },
+ "a1": {
+  "kind": "affine"
+ },
+ "a10": {
+  "kind": "affine"
+ },
+ "a11": {
+  "kind": "affine"
+ },
+ "a12": {
+  "kind": "affine"
+ },
+ "a13": {
+  "kind": "affine"
+ },
+ "a14": {
+  "kind": "affine"
+ },
+ "a15": {
+  "kind": "affine"
+ },
+ "a16": {
+  "kind": "affine"
+ },
+ "a17": {
+  "kind": "affine"
+ },
+ "a18": {
+  "kind": "affine"
+ },
+ "a19": {
+  "kind": "affine"
+ },
+ "a2": {
+  "kind": "affine"
+ },
+ "a20": {
+  "kind": "affine"
+ },
+ "a21": {
+  "kind": "affine"
+ },
+ "a22": {
+  "kind": "affine"
+ },
+ "a23": {
+  "kind": "affine"
+ },
+ "a24": {
+  "kind": "affine"
+ },
+ "a25": {
+  "kind": "affine"
+ },
+ "a26": {
+  "kind": "affine"
+ },
+ "a27": {
+  "kind": "affine"
+ },
+ "a28": {
+  "kind": "affine"
+ },
+ "a29": {
+  "kind": "affine"
+ },
+ "a3": {
+  "kind": "affine"
+ },
+ "a30": {
+  "kind": "affine"
+ },
+ "a31": {
+  "kind": "affine"
+ },
+ "a32": {
+  "kind": "affine"
+ },
+ "a33": {
+  "kind": "affine"
+ },
+ "a34": {
+  "kind": "affine"
+ },
+ "a35": {
+  "kind": "affine"
+ },
+ "a36": {
+  "kind": "affine"
+ },
+ "a37": {
+  "kind": "affine"
+ },
+ "a38": {
+  "kind": "affine"
+ },
+ "a39": {
+  "kind": "affine"
+ },
+ "a4": {
+  "kind": "affine"
+ },
+ "a5": {
+  "kind": "affine"
+ },
+ "a6": {
+  "kind": "affine"
+ },
+ "a7": {
+  "kind": "affine"
+ },
+ "a8": {
+  "kind": "affine"
+ },
+ "a9": {
+  "kind": "affine"
+ }
+}

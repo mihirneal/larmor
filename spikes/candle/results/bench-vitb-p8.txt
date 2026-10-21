@@ -1,0 +1,23 @@
+== bench-vitb-p8: bench --shape 768x12x12 --patch 8 --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f32,f16,bf16,f16-mixed,bf16-mixed --attention fused,chunked:2048 --bias broadcast,folded --runs 5
+bench random-768x12x12-p8: 8150 tokens (+1 cls), width 768 depth 12 heads 12, warmup 2, runs 5, fast math true
+options                           median ms     min ms     max ms    cold ms  peak GiB  base GiB
+f32 fused broadcast                   479.6      467.0      486.9      471.4      1.18      0.58
+f32 fused folded                      431.1      419.6      436.6      424.5      1.19      0.58
+f32 chunked:2048 broadcast            732.9      730.8      761.0      890.7      2.96      0.58
+f32 chunked:2048 folded               680.7      669.5      689.3      675.6      2.96      0.58
+f16 fused broadcast                   406.4      398.3      411.8      426.2      0.60      0.30
+f16 fused folded                      346.2      339.6      358.4      350.3      0.73      0.42
+f16 chunked:2048 broadcast            581.8      575.0      591.4      689.3      1.49      0.30
+f16 chunked:2048 folded               522.6      502.9      527.5      515.3      1.62      0.42
+bf16 fused broadcast                  407.3      398.4      413.4      411.2      0.60      0.30
+bf16 fused folded                     346.2      341.1      350.7      349.5      0.73      0.42
+bf16 chunked:2048 broadcast           568.3      561.5      575.8      701.6      1.50      0.30
+bf16 chunked:2048 folded              511.5      506.1      522.1      504.6      1.62      0.42
+f16-mixed fused broadcast             417.9      404.8      432.8      411.0      0.76      0.30
+f16-mixed fused folded                356.7      353.5      358.3      384.2      0.84      0.37
+f16-mixed chunked:2048 broadcast      590.2      583.5      612.8      582.3      2.12      0.30
+f16-mixed chunked:2048 folded         529.0      524.8      531.4      519.6      2.20      0.37
+bf16-mixed fused broadcast            765.5      356.4     1173.3      361.3      0.76      0.30
+bf16-mixed fused folded               527.8      285.2      875.3      296.1      0.84      0.37
+bf16-mixed chunked:2048 broadcast      528.3      498.4      966.9      482.2      2.12      0.30
+bf16-mixed chunked:2048 folded        560.4      548.8      577.0      429.0      2.20      0.37

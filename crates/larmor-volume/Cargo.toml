@@ -1,11 +1,17 @@
 [package]
 name = "larmor-volume"
+description = "NIfTI I/O and the nibabel / scipy.ndimage / numpy volume operations Larmor's preprocessing mirrors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 thiserror.workspace = true
-serde.workspace = true
+rayon.workspace = true
+ndarray = { version = "0.17.2", features = ["rayon"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+safetensors.workspace = true

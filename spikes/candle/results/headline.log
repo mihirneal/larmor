@@ -1,0 +1,68 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Finished `release` profile [optimized + debuginfo] target(s) in 9.32s
+== [gpu idle after 3s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f32 --attention fused --bias broadcast --runs 7
+f32 fused broadcast                   183.1      180.6      195.1      229.8      0.39      0.10
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f32 --attention fused --bias folded --runs 7
+f32 fused folded                      150.5      150.1      151.8      171.3      0.46      0.16
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f16 --attention fused --bias folded --runs 7
+f16 fused folded                      126.0      122.1      127.7      143.7      0.27      0.12
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision bf16 --attention fused --bias folded --runs 7
+bf16 fused folded                     126.1      121.3      128.2      142.7      0.27      0.12
+== [gpu idle after 37s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f16-mixed --attention fused --bias folded --runs 7
+f16-mixed fused folded                126.9      125.5      130.6      142.8      0.34      0.10
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision bf16-mixed --attention fused --bias folded --runs 7
+bf16-mixed fused folded               128.5      125.4      131.2      141.8      0.34      0.12
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f32 --attention chunked:2048 --bias folded --runs 7
+f32 chunked:2048 folded               260.8      253.6      266.1      258.4      1.35      0.16
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f16 --attention chunked:2048 --bias folded --runs 7
+f16 chunked:2048 folded               206.5      196.2     1090.6      203.5      0.72      0.12
+== [gpu idle after 59s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision f32 --attention fused --bias folded --warmup 1 --runs 5
+f32 fused folded                     5937.4     5070.1     6532.1     5069.8      2.55      0.16
+== [gpu idle after 21s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision f16 --attention fused --bias folded --warmup 1 --runs 5
+f16 fused folded                     3965.4     3960.8     3969.2     3968.1      1.32      0.12
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision bf16 --attention fused --bias folded --warmup 1 --runs 5
+bf16 fused folded                    3964.5     3962.3     3984.9     4016.1      1.32      0.12
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision f16-mixed --attention fused --bias folded --warmup 1 --runs 5
+f16-mixed fused folded               4661.9     4555.9     5002.6     5163.1      1.93      0.10
+== [gpu idle after 50s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision bf16-mixed --attention fused --bias folded --warmup 1 --runs 5
+bf16-mixed fused folded              4000.8     3996.1     4053.0     3995.0      1.93      0.10
+== [gpu idle after 4s] bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision f16 --attention chunked:4096 --bias folded --warmup 1 --runs 3
+f16 chunked:4096 folded              6309.9     6295.7     6321.8     6302.7      8.87      0.12
+== [gpu idle after 4s] bench --shape 768x12x12 --patch 8 --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f32 --attention fused --bias folded --runs 5
+f32 fused folded                      338.1      334.7      340.8      344.4      1.19      0.58
+== [gpu idle after 4s] bench --shape 768x12x12 --patch 8 --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f16 --attention fused --bias folded --runs 5
+f16 fused folded                      277.6      271.6      281.6      306.6      0.73      0.42
+== [gpu idle after 4s] bench --shape 768x12x12 --patch 8 --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision bf16-mixed --attention fused --bias folded --runs 5
+bf16-mixed fused folded               284.2      281.9      304.1      288.6      0.84      0.37
+== [gpu idle after 6s] bench --shape 1024x24x16 --patch 8 --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f32 --attention fused --bias folded --runs 5
+f32 fused folded                      906.3      899.6      911.4      907.0      2.88      2.27
+== [gpu idle after 4s] bench --shape 1024x24x16 --patch 8 --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f16 --attention fused --bias folded --runs 5
+f16 fused folded                      764.9      759.6      769.9      766.6      1.69      1.38
+== [gpu idle after 4s] bench --shape 1024x24x16 --patch 8 --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision bf16-mixed --attention fused --bias folded --runs 5
+bf16-mixed fused folded               778.0      774.6      780.8      785.0      1.71      1.24
+== [gpu idle after 4s] attention --tokens 8151 --heads 6 --precision f32,f16,bf16 --attention fused,chunked:2048 --runs 10
+f32 fused                              9.63       9.19     10.60      0.06
+f32 chunked:2048                      50.77      44.10      2.01      1.08
+f16 fused                             11.37       8.38      8.98      0.03
+f16 chunked:2048                      35.98      29.51      2.84      0.54
+bf16 fused                             8.55       7.96     11.93      0.03
+bf16 chunked:2048                     32.77      27.84      3.11      0.54
+== [gpu idle after 4s] attention --tokens 59360 --heads 6 --precision f32,f16,bf16 --attention fused,chunked:2048 --warmup 1 --runs 5
+f32 fused                            369.51     365.13     14.65      0.50
+f32 chunked:2048                    1124.79    1070.69      4.81      8.61
+f16 fused                            304.77     304.69     17.76      0.25
+f16 chunked:2048                     676.22     672.79      8.00      4.31
+bf16 fused                           305.88     303.35     17.69      0.25
+bf16 chunked:2048                    674.11     668.71      8.03      4.31
+== [gpu idle after 4s] torch MPS baseline, patch 8
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p8-ref", "tokens": 8150, "precision": "fp32", "attention": "sdpa", "median_ms": 134.69879189506173, "min_ms": 131.16312492638826, "cold_ms": 254.73558297380805, "driver_allocated_gib": 1.0475616455078125, "min_token_cosine": 0.9999997019767761, "pooled_cosine": 1.0, "max_abs_diff": 6.705522537231445e-06}
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p8-ref", "tokens": 8150, "precision": "bf16-autocast", "attention": "sdpa", "median_ms": 112.93266713619232, "min_ms": 110.63637491315603, "cold_ms": 129.4582081027329, "driver_allocated_gib": 1.0475616455078125, "min_token_cosine": 0.9999456405639648, "pooled_cosine": 0.9999836683273315, "max_abs_diff": 0.03877902030944824}
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p8-ref", "tokens": 8150, "precision": "fp16-autocast", "attention": "sdpa", "median_ms": 113.01366705447435, "min_ms": 110.12770887464285, "cold_ms": 120.82929210737348, "driver_allocated_gib": 1.0475616455078125, "min_token_cosine": 0.9999991655349731, "pooled_cosine": 0.9999998211860657, "max_abs_diff": 0.0057228803634643555}
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p8-ref", "tokens": 8150, "precision": "fp16", "attention": "sdpa", "median_ms": 110.77908286824822, "min_ms": 105.5635423399508, "cold_ms": 116.52816692367196, "driver_allocated_gib": 1.1178741455078125, "min_token_cosine": 0.999998152256012, "pooled_cosine": 0.9999995827674866, "max_abs_diff": 0.01095271110534668}
+== [gpu idle after 4s] torch MPS baseline, patch 4 (query chunks of 2048)
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p4-ref", "tokens": 59359, "precision": "fp32", "attention": "sdpa chunked:2048", "median_ms": 6261.295249685645, "min_ms": 6256.394375115633, "cold_ms": 6486.254999879748, "driver_allocated_gib": 2.1217803955078125, "min_token_cosine": 0.9999996423721313, "pooled_cosine": 1.0, "max_abs_diff": 7.569789886474609e-06}
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p4-ref", "tokens": 59359, "precision": "bf16-autocast", "attention": "sdpa chunked:2048", "median_ms": 5539.619375020266, "min_ms": 5538.447750266641, "cold_ms": 5909.2165841721, "driver_allocated_gib": 2.1081085205078125, "min_token_cosine": 0.9999426007270813, "pooled_cosine": 0.9999818205833435, "max_abs_diff": 0.047530293464660645}
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p4-ref", "tokens": 59359, "precision": "fp16-autocast", "attention": "sdpa chunked:2048", "median_ms": 5539.550541900098, "min_ms": 5536.6649171337485, "cold_ms": 5576.524541247636, "driver_allocated_gib": 2.1081085205078125, "min_token_cosine": 0.9999990463256836, "pooled_cosine": 0.9999998211860657, "max_abs_diff": 0.005255460739135742}
+{"framework": "torch 2.14.0 mps", "model": "nanobrain-vits-p4-ref", "tokens": 59359, "precision": "fp16", "attention": "sdpa chunked:2048", "median_ms": 5508.025584276766, "min_ms": 5506.196333095431, "cold_ms": 5566.03420805186, "driver_allocated_gib": 2.1784210205078125, "min_token_cosine": 0.9999983906745911, "pooled_cosine": 0.9999996423721313, "max_abs_diff": 0.011199951171875}
+done

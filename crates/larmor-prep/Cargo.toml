@@ -1,11 +1,22 @@
 [package]
 name = "larmor-prep"
+description = "nanobrain-eval preprocessing: head mask, conform, quantize, normalize and patch tokens"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-anyhow.workspace = true
+larmor-volume = { path = "../larmor-volume" }
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+rayon.workspace = true
+ndarray = { version = "0.17.2", features = ["rayon"] }
+sha2 = "0.11.1"
+
+[dev-dependencies]
+safetensors.workspace = true
+# exact parsing of the float64 affines in the reference info.json files
+serde_json = { workspace = true, features = ["float_roundtrip"] }

@@ -1,0 +1,57 @@
+id = "tiny-vit"
+family = "vit3d"
+description = "Unit-test model: 2-block ViTMAE3D, 16x24x12 grid, patch 4, 2 class tokens"
+
+[architecture]
+grid = [16, 24, 12]
+patch = 4
+width = 32
+depth = 2
+heads = 4
+mlp_ratio = 4.0
+class_tokens = 2
+pos_embed = "separable"
+qkv = "separate"
+qkv_bias = true
+proj_bias = true
+norm_eps = 1e-06
+activation = "gelu"
+
+[readout]
+tokens = "last"
+pool = "mean"
+
+[weights]
+file = "tiny-vit.safetensors"
+sha256 = "29c72f1d2ad386b2bc1ca692339af9b1e2185d9933494a46b882488670d95a22"
+url = ""
+naming = "nanobrain"
+
+[[preprocessing.steps]]
+op = "threshold_mask"
+resolution = 2.0
+sigma = 4.0
+remove_islands = true
+fill_holes = true
+
+[[preprocessing.steps]]
+op = "conform"
+min_voxel_size = 1.0
+fov = [192.0, 240.0, 192.0]
+top_margin = 5.0
+fixed_grid = true
+order = 1
+
+[[preprocessing.steps]]
+op = "quantize"
+low = 0.005
+high = 0.995
+
+[[preprocessing.steps]]
+op = "normalize"
+method = "max_zscore"
+std_floor = 1e-06
+
+[source]
+model_class = "nanobrain.model:ViTMAE3D"
+script = "tests/data/make_tiny.py"

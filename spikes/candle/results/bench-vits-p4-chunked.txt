@@ -1,0 +1,13 @@
+== bench-vits-p4-chunked: bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision f32,f16,bf16,f16-mixed,bf16-mixed --attention chunked:2048,chunked:4096 --bias folded --warmup 1 --runs 3
+bench nanobrain-vits-p4-ref: 59359 tokens (+1 cls), width 384 depth 12 heads 6, warmup 1, runs 3, fast math true
+options                           median ms     min ms     max ms    cold ms  peak GiB  base GiB
+f32 chunked:2048 folded             11094.3    11083.5    11858.0    11185.3      9.66      0.16
+f32 chunked:4096 folded             12447.2    10966.9    13133.0    10944.2     17.65      0.16
+f16 chunked:2048 folded              8116.1     7844.0     8133.4     8100.9      4.87      0.12
+f16 chunked:4096 folded              7450.0     7309.5     7653.3     7396.6      8.87      0.12
+bf16 chunked:2048 folded             8456.2     8446.5     8521.6     8508.9      4.87      0.12
+bf16 chunked:4096 folded             7536.5     7459.2     7540.1     7567.0      8.87      0.12
+f16-mixed chunked:2048 folded        8492.8     8464.8     8636.3     8626.7      7.36      0.10
+f16-mixed chunked:4096 folded        7591.0     7540.4     7616.1     7511.9     13.36      0.11
+bf16-mixed chunked:2048 folded       8339.2     8324.1     8507.6     8241.4      7.36      0.11
+bf16-mixed chunked:4096 folded       7625.3     7594.1     7779.7     7572.3     13.36      0.11

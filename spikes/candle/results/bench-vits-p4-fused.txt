@@ -1,0 +1,13 @@
+== bench-vits-p4-fused: bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p4-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p4-ref/mni152-t1w.safetensors --precision f32,f16,bf16,f16-mixed,bf16-mixed --attention fused --bias broadcast,folded --warmup 1 --runs 5
+bench nanobrain-vits-p4-ref: 59359 tokens (+1 cls), width 384 depth 12 heads 6, warmup 1, runs 5, fast math true
+options                           median ms     min ms     max ms    cold ms  peak GiB  base GiB
+f32 fused broadcast                  5352.8     5345.4     6315.7     5365.5      2.47      0.09
+f32 fused folded                     5476.0     5070.2     6160.5     6382.0      2.55      0.16
+f16 fused broadcast                  4268.3     4257.0     5054.1     4237.4      1.28      0.09
+f16 fused folded                     4454.0     3973.8     4960.8     4920.0      1.32      0.12
+bf16 fused broadcast                 4248.0     4242.6     4255.6     4239.8      1.28      0.09
+bf16 fused folded                    3985.0     3976.5     4013.7     4075.1      1.32      0.12
+f16-mixed fused broadcast            4281.6     4277.6     4286.7     4274.0      1.91      0.09
+f16-mixed fused folded               4016.5     4008.9     4077.1     3997.0      1.93      0.10
+bf16-mixed fused broadcast           4288.9     4279.8     4397.7     4299.4      1.91      0.09
+bf16-mixed fused folded              4104.9     4086.3     4109.6     4104.2      1.93      0.10

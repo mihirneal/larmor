@@ -1,0 +1,3 @@
+# The spike builds into its own target dir so it never blocks the workspace builds.
+[build]
+target-dir = "/Users/mihir/Developer/larmor/target-candle"

@@ -1,0 +1,179 @@
+{
+ "n_base_affine": {
+  "dataobj_dtype": "uint8",
+  "dtype": "uint8",
+  "kind": "nifti",
+  "notes": "no codes: centred base affine with x flip",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_big_endian_f64": {
+  "dataobj_dtype": "float64",
+  "dtype": "float64",
+  "kind": "nifti",
+  "notes": "big-endian header and data",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_dtype_int32": {
+  "dataobj_dtype": "int32",
+  "dtype": "int32",
+  "kind": "nifti",
+  "notes": "",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_dtype_int64": {
+  "dataobj_dtype": "int64",
+  "dtype": "int64",
+  "kind": "nifti",
+  "notes": "",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_dtype_int8": {
+  "dataobj_dtype": "int8",
+  "dtype": "int8",
+  "kind": "nifti",
+  "notes": "",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_dtype_uint32": {
+  "dataobj_dtype": "uint32",
+  "dtype": "uint32",
+  "kind": "nifti",
+  "notes": "",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_dtype_uint64": {
+  "dataobj_dtype": "uint64",
+  "dtype": "uint64",
+  "kind": "nifti",
+  "notes": "",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_fixups": {
+  "dataobj_dtype": "int16",
+  "dtype": "int16",
+  "kind": "nifti",
+  "notes": "qfac 0 -> 1, pixdim 0 -> 1 and negative -> abs, invalid qform code -> 0",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_four_d": {
+  "dataobj_dtype": "int16",
+  "dtype": "int16",
+  "kind": "nifti",
+  "notes": "4-D image",
+  "shape": [
+   3,
+   4,
+   5,
+   2
+  ]
+ },
+ "n_qform_qfac_neg": {
+  "dataobj_dtype": "float32",
+  "dtype": "float32",
+  "kind": "nifti",
+  "notes": "qform only, qfac -1",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_quat_w_threshold": {
+  "dataobj_dtype": "int16",
+  "dtype": "int16",
+  "kind": "nifti",
+  "notes": "1 - |bcd|^2 slightly negative but within the threshold",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_quat_w_zero": {
+  "dataobj_dtype": "int16",
+  "dtype": "int16",
+  "kind": "nifti",
+  "notes": "180 degree rotation, w recovered as 0",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_scaled_f32": {
+  "dataobj_dtype": "float64",
+  "dtype": "float32",
+  "kind": "nifti",
+  "notes": "float32 with slope and intercept",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_scaled_i16": {
+  "dataobj_dtype": "float64",
+  "dtype": "int16",
+  "kind": "nifti",
+  "notes": "int16 with slope and intercept",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_sform_wins": {
+  "dataobj_dtype": "int16",
+  "dtype": "int16",
+  "kind": "nifti",
+  "notes": "both codes set, sform takes precedence",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n_slope_zero_u16": {
+  "dataobj_dtype": "uint16",
+  "dtype": "uint16",
+  "kind": "nifti",
+  "notes": "slope 0 means unscaled",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ }
+}

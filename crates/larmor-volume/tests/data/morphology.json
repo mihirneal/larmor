@@ -1,0 +1,20 @@
+{
+ "m_dense": {
+  "kind": "morphology"
+ },
+ "m_hollow_sphere": {
+  "kind": "morphology"
+ },
+ "m_size_tie": {
+  "kind": "morphology"
+ },
+ "m_sparse": {
+  "kind": "morphology"
+ },
+ "m_touching_border": {
+  "kind": "morphology"
+ },
+ "m_tunnelled_sphere": {
+  "kind": "morphology"
+ }
+}

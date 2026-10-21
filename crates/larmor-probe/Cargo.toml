@@ -4,8 +4,29 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Whole-scan and dense linear probes with the exact numbers of nanobrain's eval framework"
+
+[features]
+# ndarray runs the tests and is the CPU fallback; metal (macOS) or cuda (Linux) runs real segmentation fits
+default = ["ndarray", "metal"]
+ndarray = ["burn/ndarray"]
+flex = ["burn/flex", "burn/rayon", "burn/simd"]
+metal = ["burn/metal"]
+wgpu = ["burn/wgpu"]
+cuda = ["burn/cuda"]
+# kernel autotuning and operation fusion on GPU backends
+autotune = ["burn/autotune"]
+fusion = ["burn/fusion"]
 
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+safetensors.workspace = true
+half.workspace = true
+rayon.workspace = true
+burn.workspace = true
+nalgebra = "0.35.0"
+sha2 = "0.11.0"

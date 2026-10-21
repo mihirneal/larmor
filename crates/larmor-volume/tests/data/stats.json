@@ -1,0 +1,110 @@
+{
+ "formula1000003": {
+  "kind": "formula",
+  "n": 1000003
+ },
+ "formula300007": {
+  "kind": "formula",
+  "n": 300007
+ },
+ "formula70001": {
+  "kind": "formula",
+  "n": 70001
+ },
+ "formula8193": {
+  "kind": "formula",
+  "n": 8193
+ },
+ "mean3d": {
+  "kind": "mean"
+ },
+ "q_half_gamma": {
+  "kind": "quantile"
+ },
+ "q_n1": {
+  "kind": "quantile"
+ },
+ "q_n2": {
+  "kind": "quantile"
+ },
+ "q_n3": {
+  "kind": "quantile"
+ },
+ "q_rand1000": {
+  "kind": "quantile"
+ },
+ "q_ties": {
+  "kind": "quantile"
+ },
+ "q_uint16_like": {
+  "kind": "quantile"
+ },
+ "sum1": {
+  "kind": "sum",
+  "n": 1
+ },
+ "sum1000": {
+  "kind": "sum",
+  "n": 1000
+ },
+ "sum127": {
+  "kind": "sum",
+  "n": 127
+ },
+ "sum128": {
+  "kind": "sum",
+  "n": 128
+ },
+ "sum129": {
+  "kind": "sum",
+  "n": 129
+ },
+ "sum136": {
+  "kind": "sum",
+  "n": 136
+ },
+ "sum15": {
+  "kind": "sum",
+  "n": 15
+ },
+ "sum16": {
+  "kind": "sum",
+  "n": 16
+ },
+ "sum17": {
+  "kind": "sum",
+  "n": 17
+ },
+ "sum2": {
+  "kind": "sum",
+  "n": 2
+ },
+ "sum255": {
+  "kind": "sum",
+  "n": 255
+ },
+ "sum256": {
+  "kind": "sum",
+  "n": 256
+ },
+ "sum31": {
+  "kind": "sum",
+  "n": 31
+ },
+ "sum4103": {
+  "kind": "sum",
+  "n": 4103
+ },
+ "sum7": {
+  "kind": "sum",
+  "n": 7
+ },
+ "sum8": {
+  "kind": "sum",
+  "n": 8
+ },
+ "sum9": {
+  "kind": "sum",
+  "n": 9
+ }
+}
