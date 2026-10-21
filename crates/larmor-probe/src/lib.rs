@@ -3,8 +3,8 @@
 //!
 //! - [`regression`]: `probe_regression` (StandardScaler + RidgeCV with efficient leave-one-out).
 //! - [`classification`]: `probe_binary_classification` (StandardScaler + LogisticRegressionCV).
-//! - [`segmentation`]: `probe_binary_segmentation` (per-voxel L2 logistic heads on patch tokens, on a Burn
-//!   device).
+//! - [`segmentation`]: `probe_binary_segmentation` (per-voxel L2 logistic heads on patch tokens, on a
+//!   [`device::Device`]: Metal, CUDA or the CPU through Candle).
 //! - [`fit`]: what `larmor probe fit` runs: the eval-identical CV plus a deployable probe refit on
 //!   everything.
 //! - [`probe_file`]: `probe.toml` + `probe.safetensors`, and the check that refuses mismatched embeddings.
@@ -15,6 +15,7 @@
 
 pub mod bootstrap;
 pub mod classification;
+pub mod device;
 pub mod fit;
 pub mod folds;
 pub mod lbfgsb;
@@ -29,4 +30,5 @@ pub mod rng;
 pub mod scaler;
 pub mod segmentation;
 
+pub use device::{Device, DeviceChoice, DeviceError};
 pub use matrix::Matrix;

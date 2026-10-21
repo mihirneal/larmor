@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{Reference, test_data};
+use common::{Reference, test_data, test_device};
 use larmor_probe::Matrix;
 use larmor_probe::fit::{
     Provenance, fit_classification_probe, fit_regression_probe, fit_segmentation_probe_file,
@@ -93,7 +93,6 @@ fn classification_probe_round_trips() {
 }
 
 #[test]
-#[allow(deprecated)]
 fn segmentation_probe_round_trips() {
     let reference = Reference::load(&test_data("segmentation_fit"));
     let d = reference.shape("features")[1];
@@ -113,7 +112,7 @@ fn segmentation_probe_round_trips() {
             ),
         })
         .collect();
-    let device = burn::tensor::Device::ndarray();
+    let device = test_device();
     let options = SegmentationOptions { alphas: vec![1e3, 1e5], n_inner_folds: 3, ..Default::default() };
     let fold_column = [0, 0, 1, 1, 2, 2];
     let (mut probe, _) =

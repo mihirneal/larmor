@@ -5,13 +5,13 @@
 //! [`Probe::check_embeddings`] refuses any other.
 
 use crate::classification::ClassificationModel;
+use crate::device::{Device, DeviceError};
 use crate::logistic::LogisticFit;
 use crate::matrix::Matrix;
 use crate::regression::RegressionModel;
 use crate::ridge::{GcvMode, RidgeFit};
 use crate::scaler::StandardScaler;
 use crate::segmentation::{LinearHead, SegmentationModel};
-use burn::tensor::Device;
 use safetensors::SafeTensors;
 use safetensors::tensor::{Dtype, TensorView};
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,8 @@ pub enum ProbeError {
     Io { path: PathBuf, source: std::io::Error },
     #[error("probe.toml: {0}")]
     Toml(String),
+    #[error(transparent)]
+    Device(#[from] DeviceError),
 }
 
 /// A probe file: metadata and weights.
@@ -239,7 +241,7 @@ impl Probe {
         match &self.weights {
             ProbeWeights::Segmentation(model) => {
                 let threshold = model.threshold.ok_or_else(|| ProbeError::Weights("no threshold".into()))?;
-                Ok((model.predict(tokens, device), threshold))
+                Ok((model.predict(tokens, device)?, threshold))
             }
             other => Err(ProbeError::WrongKind { probe: other.kind(), wanted: ProbeKind::Segmentation }),
         }

@@ -2,9 +2,20 @@
 
 #![allow(dead_code)]
 
+use larmor_probe::{Device, DeviceChoice};
 use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+/// The CPU by default; `LARMOR_TEST_DEVICE=gpu` (or `metal`, `cuda`, `cuda:N`, `auto`) runs the segmentation
+/// tests on that device instead.
+pub fn test_device() -> Device {
+    let choice = match std::env::var("LARMOR_TEST_DEVICE") {
+        Ok(name) => name.parse().unwrap_or_else(|e| panic!("LARMOR_TEST_DEVICE: {e}")),
+        Err(_) => DeviceChoice::Cpu,
+    };
+    Device::open(choice).unwrap_or_else(|e| panic!("{e}"))
+}
 
 pub fn test_data(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)

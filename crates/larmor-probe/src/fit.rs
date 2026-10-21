@@ -7,6 +7,7 @@
 use crate::classification::{
     ClassificationCv, ClassificationModel, classification_folds, probe_binary_classification,
 };
+use crate::device::Device;
 use crate::folds::{Fold, folds_from_column};
 use crate::logistic::{LogisticCvOptions, LogisticSolver};
 use crate::matrix::Matrix;
@@ -17,7 +18,6 @@ use crate::segmentation::{
     segmentation_folds,
 };
 use anyhow::{Result, ensure};
-use burn::tensor::Device;
 use toml::{Table, Value};
 
 /// Where the training embeddings and labels came from; copied into `probe.toml`.

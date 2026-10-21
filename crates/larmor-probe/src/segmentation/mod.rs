@@ -9,14 +9,16 @@
 pub mod solver;
 
 use crate::bootstrap::{self, take};
+use crate::device::{Device, DeviceError};
 use crate::folds::{Fold, FoldError, kfold};
 use crate::matrix::Matrix;
 use crate::numpy;
 use crate::regression::CV_SEED;
 use crate::rng::torch_randperm;
-use burn::tensor::Device;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 pub use solver::{FitStats, LinearHead, SolverOptions, SolverStop, fit_logistic, predict_on_device};
+use thiserror::Error;
 
 /// Voxels per 8 mm patch: the outputs of the probe on nanobrain's eval grid (`probe.py::patchify3d`).
 pub const PATCH_VOXELS: usize = 512;
@@ -99,6 +101,15 @@ impl Default for SegmentationOptions {
     }
 }
 
+/// Why a segmentation probe could not be fitted.
+#[derive(Debug, Error)]
+pub enum SegmentationError {
+    #[error(transparent)]
+    Folds(#[from] FoldError),
+    #[error(transparent)]
+    Device(#[from] DeviceError),
+}
+
 /// The outer folds of probe_binary_segmentation: `KFold(5, shuffle=True, random_state=0)` over subjects.
 pub fn segmentation_folds(n_subjects: usize) -> Result<Vec<Fold>, FoldError> {
     kfold(n_subjects, 5, Some(CV_SEED))
@@ -123,7 +134,7 @@ impl SegmentationModel {
     }
 
     /// Voxel probabilities `[n_patches, voxels]`, row-major: `sigmoid(standardize(x) @ coef + intercept)`.
-    pub fn predict(&self, features: &Matrix<f32>, device: &Device) -> Vec<f32> {
+    pub fn predict(&self, features: &Matrix<f32>, device: &Device) -> Result<Vec<f32>, DeviceError> {
         predict_on_device(&self.head, &self.standardize(features), device)
     }
 }
@@ -201,13 +212,15 @@ pub fn feature_moments(features: &Matrix<f32>) -> (Vec<f32>, Vec<f32>) {
 }
 
 fn standardize(features: &Matrix<f32>, mean: &[f32], std: &[f32]) -> Matrix<f32> {
-    let mut out = features.clone();
-    for i in 0..out.rows() {
-        for ((v, &m), &s) in out.row_mut(i).iter_mut().zip(mean).zip(std) {
-            *v = (*v - m) / s;
-        }
+    let mut data = features.data().to_vec();
+    if !mean.is_empty() {
+        data.par_chunks_mut(mean.len()).for_each(|row| {
+            for ((v, &m), &s) in row.iter_mut().zip(mean).zip(std) {
+                *v = (*v - m) / s;
+            }
+        });
     }
-    out
+    Matrix::new(features.rows(), features.cols(), data)
 }
 
 /// `fit_predict_segmentation` without the prediction: standardize the training patches and fit the head.
@@ -217,16 +230,38 @@ pub fn fit_segmentation(
     solver: &SolverOptions,
     init: Option<&LinearHead>,
     device: &Device,
-) -> (SegmentationModel, FitStats) {
+) -> Result<(SegmentationModel, FitStats), DeviceError> {
     let (mean, std) = feature_moments(&training.features);
     let standardized = standardize(&training.features, &mean, &std);
-    let (head, stats) = fit_logistic(&standardized, &training.labels, alpha, solver, init, device);
-    (SegmentationModel { mean, std, head, alpha, threshold: None }, stats)
+    let (head, stats) = fit_logistic(&standardized, &training.labels, alpha, solver, init, device)?;
+    Ok((SegmentationModel { mean, std, head, alpha, threshold: None }, stats))
 }
 
 /// `probe.py::dice_by_threshold`: Dice at each threshold (`p >= t`), 1 when prediction and label are empty.
 pub fn dice_by_threshold(probabilities: &[f32], labels: &[u8], thresholds: &[f32]) -> Vec<f32> {
     let n_label: usize = labels.iter().map(|&l| usize::from(l)).sum();
+    let (predicted, overlap) = if thresholds.is_sorted() {
+        counts_at_sorted_thresholds(probabilities, labels, thresholds)
+    } else {
+        counts_at_thresholds(probabilities, labels, thresholds)
+    };
+    predicted
+        .iter()
+        .zip(&overlap)
+        .map(|(&predicted, &overlap)| {
+            let denominator = predicted + n_label;
+            // torch divides the integer counts in float32
+            if denominator > 0 { (2 * overlap) as f32 / denominator as f32 } else { 1.0 }
+        })
+        .collect()
+}
+
+/// Per threshold: the voxels with `p >= t`, and those of them that are labelled.
+fn counts_at_thresholds(
+    probabilities: &[f32],
+    labels: &[u8],
+    thresholds: &[f32],
+) -> (Vec<usize>, Vec<usize>) {
     thresholds
         .iter()
         .map(|&threshold| {
@@ -237,11 +272,50 @@ pub fn dice_by_threshold(probabilities: &[f32], labels: &[u8], thresholds: &[f32
                     overlap += usize::from(l > 0);
                 }
             }
-            let denominator = predicted + n_label;
-            // torch divides the integer counts in float32
-            if denominator > 0 { (2 * overlap) as f32 / denominator as f32 } else { 1.0 }
+            (predicted, overlap)
         })
-        .collect()
+        .unzip()
+}
+
+/// [`counts_at_thresholds`] in one pass when the thresholds ascend: each voxel is counted at the number of
+/// thresholds it reaches, and the counts are summed from the top.
+fn counts_at_sorted_thresholds(
+    probabilities: &[f32],
+    labels: &[u8],
+    thresholds: &[f32],
+) -> (Vec<usize>, Vec<usize>) {
+    let n = thresholds.len();
+    let (mut predicted, mut overlap) = (vec![0usize; n + 1], vec![0usize; n + 1]);
+    for (&p, &l) in probabilities.iter().zip(labels) {
+        // most voxels are below every threshold; NaN reaches none
+        let reached = if n == 0 || p < thresholds[0] { 0 } else { thresholds.partition_point(|&t| t <= p) };
+        predicted[reached] += 1;
+        overlap[reached] += usize::from(l > 0);
+    }
+    for i in (0..n).rev() {
+        predicted[i] += predicted[i + 1];
+        overlap[i] += overlap[i + 1];
+    }
+    (predicted[1..].to_vec(), overlap[1..].to_vec())
+}
+
+/// Voxel indices ordered by probability, ties in index order: what a stable sort by `f32::total_cmp` gives,
+/// but sorting packed `(probability, index)` keys, which is several times faster on millions of voxels.
+fn voxels_by_probability(probabilities: &[f32], descending: bool) -> Vec<usize> {
+    assert!(probabilities.len() <= 1 << 32, "too many voxels for 32-bit indices");
+    let mut keys: Vec<u64> = probabilities
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            // the bit pattern f32::total_cmp orders by, as an unsigned integer
+            let bits = p.to_bits() as i32;
+            let ordered = (bits ^ ((((bits >> 31) as u32) >> 1) as i32)) as u32 ^ 0x8000_0000;
+            let ordered = if descending { !ordered } else { ordered };
+            (u64::from(ordered) << 32) | i as u64
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.into_iter().map(|key| (key & 0xffff_ffff) as usize).collect()
 }
 
 /// `probe.py::average_precision`: voxel average precision, NaN without positives. Ties are not merged; they
@@ -251,8 +325,7 @@ pub fn average_precision(probabilities: &[f32], labels: &[u8]) -> f64 {
     if n_positive == 0 {
         return f64::NAN;
     }
-    let mut order: Vec<usize> = (0..probabilities.len()).collect();
-    order.sort_by(|&a, &b| probabilities[b].total_cmp(&probabilities[a]));
+    let order = voxels_by_probability(probabilities, true);
     let mut hits = 0.0f32;
     let mut total = 0.0f64;
     for (rank, &i) in order.iter().enumerate() {
@@ -273,8 +346,7 @@ pub fn voxel_auroc(probabilities: &[f32], labels: &[u8]) -> f64 {
         return f64::NAN;
     }
     let n_negative = labels.len() - n_positive;
-    let mut order: Vec<usize> = (0..probabilities.len()).collect();
-    order.sort_by(|&a, &b| probabilities[a].total_cmp(&probabilities[b]));
+    let order = voxels_by_probability(probabilities, false);
     let rank_sum: f64 =
         order.iter().enumerate().filter(|&(_, &i)| labels[i] > 0).map(|(rank, _)| (rank + 1) as f64).sum();
     let (p, q) = (n_positive as f64, n_negative as f64);
@@ -321,7 +393,7 @@ pub fn select_alpha_threshold(
     options: &SegmentationOptions,
     device: &Device,
     records: &mut Vec<FitRecord>,
-) -> Result<Selection, FoldError> {
+) -> Result<Selection, SegmentationError> {
     let (n_alphas, n_thresholds) = (options.alphas.len(), options.thresholds.len());
     // inner_dice[alpha][subject][threshold], filled for the subjects of train_ids
     let mut inner_dice = vec![vec![vec![0.0f32; n_thresholds]; subjects.len()]; n_alphas];
@@ -329,12 +401,21 @@ pub fn select_alpha_threshold(
         let inner_train: Vec<usize> = split.train.iter().map(|&i| train_ids[i]).collect();
         let inner_val: Vec<usize> = split.test.iter().map(|&i| train_ids[i]).collect();
         let training = TrainingSet::new(subjects, &inner_train, options.max_negative_ratio);
-        let fits = fit_all_alphas(&training, options, device);
+        let fits = fit_all_alphas(&training, options, device)?;
         for (alpha_id, (model, stats)) in fits.into_iter().enumerate() {
-            for &subject in &inner_val {
-                let probabilities = model.predict(&subjects[subject].features, device);
-                inner_dice[alpha_id][subject] =
-                    dice_by_threshold(&probabilities, subjects[subject].labels.data(), &options.thresholds);
+            let probabilities = inner_val
+                .iter()
+                .map(|&subject| model.predict(&subjects[subject].features, device))
+                .collect::<Result<Vec<_>, _>>()?;
+            let dice: Vec<Vec<f32>> = inner_val
+                .par_iter()
+                .zip(&probabilities)
+                .map(|(&subject, p)| {
+                    dice_by_threshold(p, subjects[subject].labels.data(), &options.thresholds)
+                })
+                .collect();
+            for (&subject, dice) in inner_val.iter().zip(dice) {
+                inner_dice[alpha_id][subject] = dice;
             }
             if options.record_fits {
                 records.push(FitRecord {
@@ -374,7 +455,7 @@ fn fit_all_alphas(
     training: &TrainingSet,
     options: &SegmentationOptions,
     device: &Device,
-) -> Vec<(SegmentationModel, FitStats)> {
+) -> Result<Vec<(SegmentationModel, FitStats)>, DeviceError> {
     let mut fits: Vec<Option<(SegmentationModel, FitStats)>> = vec![None; options.alphas.len()];
     let mut order: Vec<usize> = (0..options.alphas.len()).collect();
     if options.warm_start {
@@ -384,11 +465,11 @@ fn fit_all_alphas(
     for alpha_id in order {
         let init = if options.warm_start { previous.as_ref() } else { None };
         let (model, stats) =
-            fit_segmentation(training, options.alphas[alpha_id], &options.solver, init, device);
+            fit_segmentation(training, options.alphas[alpha_id], &options.solver, init, device)?;
         previous = Some(model.head.clone());
         fits[alpha_id] = Some((model, stats));
     }
-    fits.into_iter().map(|fit| fit.expect("every alpha fitted")).collect()
+    Ok(fits.into_iter().map(|fit| fit.expect("every alpha fitted")).collect())
 }
 
 /// `tensor.sum(dim=1)` of a float32 `[n_alphas, n_subjects, n_thresholds]` tensor on an aarch64 CPU, for one
@@ -476,7 +557,7 @@ pub fn probe_binary_segmentation(
     folds: &[Fold],
     options: &SegmentationOptions,
     device: &Device,
-) -> Result<SegmentationCv, FoldError> {
+) -> Result<SegmentationCv, SegmentationError> {
     let n = subjects.len();
     let mut subject_dice = vec![0.0f64; n];
     let mut subject_ap = vec![0.0f64; n];
@@ -490,15 +571,27 @@ pub fn probe_binary_segmentation(
             select_alpha_threshold(subjects, &fold.train, Some(fold_index), options, device, &mut fits)?;
         let alpha = options.alphas[selection.alpha_id];
         let training = TrainingSet::new(subjects, &fold.train, options.max_negative_ratio);
-        let (mut model, stats) = fit_segmentation(&training, alpha, &options.solver, None, device);
+        let (mut model, stats) = fit_segmentation(&training, alpha, &options.solver, None, device)?;
         model.threshold = Some(options.thresholds[selection.threshold_id]);
-        for &subject in &fold.test {
-            let p = model.predict(&subjects[subject].features, device);
-            let labels = subjects[subject].labels.data();
-            subject_dice[subject] =
-                f64::from(dice_by_threshold(&p, labels, &options.thresholds)[selection.threshold_id]);
-            subject_ap[subject] = average_precision(&p, labels);
-            subject_auroc[subject] = voxel_auroc(&p, labels);
+        let fold_probabilities = fold
+            .test
+            .iter()
+            .map(|&subject| model.predict(&subjects[subject].features, device))
+            .collect::<Result<Vec<_>, _>>()?;
+        let scores: Vec<(f64, f64, f64)> = fold
+            .test
+            .par_iter()
+            .zip(&fold_probabilities)
+            .map(|(&subject, p)| {
+                let labels = subjects[subject].labels.data();
+                let dice = dice_by_threshold(p, labels, &options.thresholds)[selection.threshold_id];
+                (f64::from(dice), average_precision(p, labels), voxel_auroc(p, labels))
+            })
+            .collect();
+        for ((&subject, p), (dice, ap, auroc)) in fold.test.iter().zip(fold_probabilities).zip(scores) {
+            subject_dice[subject] = dice;
+            subject_ap[subject] = ap;
+            subject_auroc[subject] = auroc;
             subject_fold[subject] = fold_index;
             probabilities[subject] = p;
         }
@@ -544,13 +637,13 @@ pub fn fit_segmentation_probe(
     subjects: &[SubjectPatches],
     options: &SegmentationOptions,
     device: &Device,
-) -> Result<(SegmentationModel, Selection, Vec<FitRecord>), FoldError> {
+) -> Result<(SegmentationModel, Selection, Vec<FitRecord>), SegmentationError> {
     let all: Vec<usize> = (0..subjects.len()).collect();
     let mut records = Vec::new();
     let selection = select_alpha_threshold(subjects, &all, None, options, device, &mut records)?;
     let training = TrainingSet::new(subjects, &all, options.max_negative_ratio);
     let (mut model, stats) =
-        fit_segmentation(&training, options.alphas[selection.alpha_id], &options.solver, None, device);
+        fit_segmentation(&training, options.alphas[selection.alpha_id], &options.solver, None, device)?;
     model.threshold = Some(options.thresholds[selection.threshold_id]);
     if options.record_fits {
         records.push(FitRecord {
@@ -584,6 +677,32 @@ mod tests {
         assert_eq!(voxel_auroc(&p, &y), 1.0);
         assert_eq!(average_precision(&p, &y), 1.0);
         assert!(voxel_auroc(&p, &[0, 0, 0, 0]).is_nan());
+    }
+
+    #[test]
+    fn one_pass_dice_counts_match_the_direct_ones() {
+        let probabilities: Vec<f32> = (0..2000).map(|i| ((i * 7919) % 1000) as f32 / 1000.0).collect();
+        let labels: Vec<u8> = (0..2000).map(|i| u8::from(i % 3 == 0)).collect();
+        let mut probabilities_with_edges = probabilities.clone();
+        probabilities_with_edges.extend([f32::NAN, 0.001, SEGMENTATION_THRESHOLDS[29], 1.0]);
+        let mut labels_with_edges = labels.clone();
+        labels_with_edges.extend([1, 1, 0, 1]);
+        let thresholds = SEGMENTATION_THRESHOLDS;
+        assert_eq!(
+            counts_at_sorted_thresholds(&probabilities_with_edges, &labels_with_edges, &thresholds),
+            counts_at_thresholds(&probabilities_with_edges, &labels_with_edges, &thresholds)
+        );
+    }
+
+    #[test]
+    fn voxel_order_is_a_stable_sort() {
+        let p = [0.5, -0.0, 0.0, 1.0, 0.5, f32::NAN, 0.25, 0.5, -1.0];
+        let mut ascending: Vec<usize> = (0..p.len()).collect();
+        ascending.sort_by(|&a, &b| p[a].total_cmp(&p[b]));
+        assert_eq!(voxels_by_probability(&p, false), ascending);
+        let mut descending: Vec<usize> = (0..p.len()).collect();
+        descending.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
+        assert_eq!(voxels_by_probability(&p, true), descending);
     }
 
     #[test]

@@ -7,29 +7,20 @@
 //!
 //! The fixture tests are `#[ignore]`d because their data lives in `fixtures/` (about 200 MB):
 //! `cargo test -p larmor-probe --release --test segmentation -- --ignored --nocapture`.
-//! Set `LARMOR_TEST_DEVICE=gpu` to run them on the default GPU device instead of ndarray.
+//! Set `LARMOR_TEST_DEVICE=gpu` to run them on the GPU (Metal or CUDA) instead of the CPU.
 
 mod common;
 
-use burn::tensor::Device;
-use common::{Reference, check, fixture, json_f64s, max_abs_diff, report, test_data};
-use larmor_probe::Matrix;
+use common::{Reference, check, fixture, json_f64s, max_abs_diff, report, test_data, test_device};
 use larmor_probe::folds::fold_assignment;
 use larmor_probe::segmentation::{
-    FitStage, PATCH_VOXELS, SegmentationOptions, SubjectPatches, TrainingSet, dice_by_threshold,
-    feature_moments, fit_segmentation, fit_segmentation_probe, probe_binary_segmentation, segmentation_folds,
+    FitRecord, FitStage, PATCH_VOXELS, SEGMENTATION_THRESHOLDS, SegmentationOptions, SubjectPatches,
+    TrainingSet, dice_by_threshold, feature_moments, fit_segmentation, fit_segmentation_probe,
+    probe_binary_segmentation, segmentation_folds,
 };
+use larmor_probe::{Device, Matrix};
 use serde_json::Value;
 use std::time::Instant;
-
-/// ndarray by default (burn 0.22 deprecates it in favour of flex, but it is the reference CPU backend here).
-#[allow(deprecated)]
-fn device() -> Device {
-    match std::env::var("LARMOR_TEST_DEVICE").as_deref() {
-        Ok("gpu") => Device::default(),
-        _ => Device::ndarray(),
-    }
-}
 
 fn widen(values: &[f32]) -> Vec<f64> {
     values.iter().map(|&v| f64::from(v)).collect()
@@ -57,7 +48,7 @@ fn single_fits_reach_the_optimum() {
     let labels = Matrix::new(features.rows(), PATCH_VOXELS, reference.u8s("labels"));
     let test_features = Matrix::new(reference.shape("test_features")[0], d, reference.f32s("test_features"));
     let subjects = vec![SubjectPatches { features, labels }];
-    let device = device();
+    let device = test_device();
     for fit in reference.info["fits"].as_array().unwrap() {
         let name = fit["name"].as_str().unwrap();
         let tag = name.split('.').next().unwrap();
@@ -82,10 +73,10 @@ fn single_fits_reach_the_optimum() {
 
         let alpha = fit["alpha"].as_f64().unwrap();
         let start = Instant::now();
-        let (model, stats) = fit_segmentation(&training, alpha, &Default::default(), None, &device);
+        let (model, stats) = fit_segmentation(&training, alpha, &Default::default(), None, &device).unwrap();
         let seconds = start.elapsed().as_secs_f64();
         println!(
-            "fit {name}: {stats:?} ({seconds:.2}s here, torch {:.2}s; timings preliminary, shared machine)",
+            "fit {name}: {stats:?} ({seconds:.2}s on {device}, torch {:.2}s; timings preliminary, shared machine)",
             fit["torch_seconds"].as_f64().unwrap()
         );
 
@@ -161,11 +152,122 @@ fn result_f64s(result: &Value, key: &str) -> Vec<f64> {
     json_f64s(&result[key])
 }
 
+/// Dice is a step function of every voxel probability, so a voxel whose probability at the optimum lies within
+/// this distance of a threshold can land on either side of it in any float32 fit: ours reach the optimum's
+/// probabilities to about 1e-6, and the optimum's own float32 coefficients move them by about 1e-7.
+const BORDERLINE: f64 = 1e-5;
+
+/// The fits behind one mean inner Dice grid and the subjects it averages over.
+struct InnerFits<'a> {
+    records: &'a [FitRecord],
+    /// `Some(outer fold)`, or `None` for the deployable probe's selection.
+    fold: Option<usize>,
+    n_subjects: usize,
+}
+
+/// A mean inner Dice grid cell recomputed with every borderline voxel decided as at the optimum, and how far
+/// those voxels' optimum probabilities are from the threshold. Panics if a voxel that is not borderline falls
+/// on the other side of the threshold.
+fn cell_without_borderline_voxels(
+    reference: &Reference,
+    subjects: &[SubjectPatches],
+    fits: &InnerFits,
+    alpha_id: usize,
+    threshold: f32,
+    device: &Device,
+) -> (f64, Vec<f64>) {
+    let mut dice_sum = 0.0f64;
+    let mut borderline = Vec::new();
+    let inner_fits = fits.records.iter().filter(|r| {
+        r.alpha_id == alpha_id && matches!(r.stage, FitStage::Inner { fold, .. } if fold == fits.fold)
+    });
+    for record in inner_fits {
+        let index = reference_index(record.stage, alpha_id);
+        let coef = reference.f32s(&format!("exact.fit{index:03}.coef"));
+        let intercept = reference.f32s(&format!("exact.fit{index:03}.intercept"));
+        for subject in json_f64s(&reference.info["exact"]["fits"][index]["test_ids"]) {
+            let subject = &subjects[subject as usize];
+            let ours = record.model.predict(&subject.features, device).unwrap();
+            let optimum = sigmoid_rows(&record.model.standardize(&subject.features), &coef, &intercept);
+            let labels = subject.labels.data();
+            let (mut predicted, mut overlap) = (0usize, 0usize);
+            for ((&p, &q), &label) in ours.iter().zip(&optimum).zip(labels) {
+                let mut positive = p >= threshold;
+                if positive != (q >= f64::from(threshold)) {
+                    let distance = (q - f64::from(threshold)).abs();
+                    assert!(
+                        distance <= BORDERLINE,
+                        "fit {index}: probability {p} vs {q} at the optimum, {distance:e} from threshold {threshold}"
+                    );
+                    positive = !positive;
+                    borderline.push(distance);
+                }
+                predicted += usize::from(positive);
+                overlap += usize::from(positive && label > 0);
+            }
+            let denominator = predicted + labels.iter().filter(|&&l| l > 0).count();
+            dice_sum +=
+                if denominator > 0 { f64::from((2 * overlap) as f32 / denominator as f32) } else { 1.0 };
+        }
+    }
+    (dice_sum / fits.n_subjects as f64, borderline)
+}
+
+/// Checks a mean inner Dice grid (`[fold][alpha][threshold]` flattened) against the optimum's. Cells beyond
+/// tolerance must be explained by borderline voxels alone (see [`BORDERLINE`]): with those decided as at the
+/// optimum they must come within tolerance.
+#[allow(clippy::too_many_arguments)]
+fn check_dice_grid(
+    name: &str,
+    ours: &[f64],
+    expected: &[f64],
+    tolerance: f64,
+    reference: &Reference,
+    subjects: &[SubjectPatches],
+    fits_per_grid: &[InnerFits],
+    device: &Device,
+) {
+    let diff = max_abs_diff(ours, expected);
+    if diff <= tolerance {
+        return check(name, diff, tolerance);
+    }
+    report(name, diff, tolerance);
+    let cells_per_grid = ours.len() / fits_per_grid.len();
+    let n_thresholds = SEGMENTATION_THRESHOLDS.len();
+    let mut corrected = ours.to_vec();
+    let mut n_borderline = 0;
+    for (i, value) in corrected.iter_mut().enumerate() {
+        if (*value - expected[i]).abs() <= tolerance {
+            continue;
+        }
+        let fits = &fits_per_grid[i / cells_per_grid];
+        let (alpha_id, threshold_id) = ((i % cells_per_grid) / n_thresholds, i % n_thresholds);
+        let threshold = SEGMENTATION_THRESHOLDS[threshold_id];
+        let (cell, distances) =
+            cell_without_borderline_voxels(reference, subjects, fits, alpha_id, threshold, device);
+        let distances_text: Vec<String> = distances.iter().map(|d| format!("{d:.2e}")).collect();
+        println!(
+            "{name}: fold {:?} alpha {alpha_id} threshold {threshold}: {value} vs {} at the optimum; the \
+             voxel(s) [{}] from the threshold at the optimum, decided as there, give {cell}",
+            fits.fold,
+            expected[i],
+            distances_text.join(", ")
+        );
+        *value = cell;
+        n_borderline += distances.len();
+    }
+    check(
+        &format!("{name}, {n_borderline} borderline voxel(s) decided as at the optimum"),
+        max_abs_diff(&corrected, expected),
+        tolerance,
+    );
+}
+
 fn check_segmentation_fixture(stem: &str) {
     let reference = Reference::load(&fixture(stem));
     let subjects = load_subjects(&reference);
     let ratio = reference.info["max_negative_ratio"].as_f64();
-    let device = device();
+    let device = test_device();
     let options = SegmentationOptions { max_negative_ratio: ratio, record_fits: true, ..Default::default() };
 
     let folds = segmentation_folds(subjects.len()).unwrap();
@@ -180,7 +282,7 @@ fn check_segmentation_fixture(stem: &str) {
         fit_segmentation_probe(&subjects, &options, &device).unwrap();
     let final_seconds = start.elapsed().as_secs_f64();
     println!(
-        "{stem}: outer CV {cv_seconds:.1}s, deployable probe {final_seconds:.1}s on {device:?} (preliminary, shared machine)"
+        "{stem}: outer CV {cv_seconds:.1}s, deployable probe {final_seconds:.1}s on {device} (preliminary, shared machine)"
     );
 
     // every fit: the same training rows, and coefficients at the optimum
@@ -226,6 +328,12 @@ fn check_segmentation_fixture(stem: &str) {
     );
 
     // the inner Dice grids and what they chose
+    let fold_fits: Vec<InnerFits> = folds
+        .iter()
+        .enumerate()
+        .map(|(f, fold)| InnerFits { records: &cv.fits, fold: Some(f), n_subjects: fold.train.len() })
+        .collect();
+    let final_fits_ = [InnerFits { records: &final_fits, fold: None, n_subjects: subjects.len() }];
     for (tag, tolerance) in [("exact", 1e-4), ("torch", 1e-2)] {
         let grids = reference.f64s(&format!("{tag}.mean_inner_dice"));
         let ours: Vec<f64> = cv
@@ -233,23 +341,37 @@ fn check_segmentation_fixture(stem: &str) {
             .iter()
             .flat_map(|s| s.mean_inner_dice.iter().flatten().map(|&v| f64::from(v)))
             .collect();
-        let diff = max_abs_diff(&ours, &grids);
-        if tag == "exact" {
-            check(
-                &format!("{stem} mean inner Dice grids (5 folds x 5 alphas x 30 thresholds) vs {tag}"),
-                diff,
-                tolerance,
-            )
-        } else {
-            report(&format!("{stem} mean inner Dice grids vs {tag}"), diff, tolerance)
-        }
         let final_grid: Vec<f64> =
             final_selection.mean_inner_dice.iter().flatten().map(|&v| f64::from(v)).collect();
-        let diff = max_abs_diff(&final_grid, &reference.f64s(&format!("{tag}.final.mean_inner_dice")));
+        let final_expected = reference.f64s(&format!("{tag}.final.mean_inner_dice"));
         if tag == "exact" {
-            check(&format!("{stem} deployable mean inner Dice grid vs {tag}"), diff, tolerance)
+            check_dice_grid(
+                &format!("{stem} mean inner Dice grids (5 folds x 5 alphas x 30 thresholds) vs {tag}"),
+                &ours,
+                &grids,
+                tolerance,
+                &reference,
+                &subjects,
+                &fold_fits,
+                &device,
+            );
+            check_dice_grid(
+                &format!("{stem} deployable mean inner Dice grid vs {tag}"),
+                &final_grid,
+                &final_expected,
+                tolerance,
+                &reference,
+                &subjects,
+                &final_fits_,
+                &device,
+            );
         } else {
-            report(&format!("{stem} deployable mean inner Dice grid vs {tag}"), diff, tolerance)
+            report(&format!("{stem} mean inner Dice grids vs {tag}"), max_abs_diff(&ours, &grids), tolerance);
+            report(
+                &format!("{stem} deployable mean inner Dice grid vs {tag}"),
+                max_abs_diff(&final_grid, &final_expected),
+                tolerance,
+            );
         }
     }
 
