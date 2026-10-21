@@ -19,6 +19,8 @@ safetensors = "0.8"
 half = "2"
 rayon = "1"
 burn = { version = "0.22.1", default-features = false, features = ["std"] }
+candle-core = { version = "0.11.0", default-features = false }
+candle-nn = { version = "0.11.0", default-features = false }
 
 [profile.dev]
 opt-level = 1
