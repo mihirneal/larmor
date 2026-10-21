@@ -1,0 +1,15 @@
+/target
+/target-*
+/fixtures
+/tools/.venv
+__pycache__/
+.pytest_cache/
+.DS_Store
+
+# scans, weights and embeddings never go in the repo
+*.nii
+*.nii.gz
+*.dcm
+*.pth
+*.safetensors
+!/crates/*/tests/data/*.safetensors

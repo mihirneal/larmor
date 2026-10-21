@@ -1,0 +1,26 @@
+# Reference tools: PyTorch/nibabel/scipy outputs that Larmor is checked against.
+# Versions match nanobrain's uv.lock so the reference behaves like the cluster.
+[project]
+name = "larmor-tools"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "torch==2.14.0",
+    "numpy==2.5.3",
+    "scipy==1.18.1",
+    "nibabel==5.4.2",
+    "scikit-learn==1.8.0",
+    "einops==0.8.2",
+    "jaxtyping==0.3.11",
+    "timm==1.0.29",
+    "safetensors==0.8.0",
+    "templateflow==25.1.2",
+    "datasets==5.0.1",
+    "fsspec==2026.6.0",
+    "zstandard==0.25.0",
+    "pandas==3.0.5",
+    "pytest",
+]
+
+[tool.uv]
+package = false
