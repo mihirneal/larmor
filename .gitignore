@@ -13,3 +13,6 @@ __pycache__/
 *.pth
 *.safetensors
 !/crates/*/tests/data/*.safetensors
+
+# agent worktrees
+/.claude/
