@@ -1,10 +1,11 @@
 //! The encoder as the CLI sees it: load a manifest on a device, encode one scan's patches.
 
 use std::any::Any;
+use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Instant;
 
-use burn::tensor::{Device, Int, Tensor, TensorData};
+use candle_core::{Device, Tensor};
 
 use crate::attention::AttentionOptions;
 use crate::device::{DeviceChoice, Precision};
@@ -18,14 +19,13 @@ use crate::weights::WeightReader;
 pub struct EncoderOptions {
     /// Compute device.
     pub device: DeviceChoice,
-    /// Matmul precision; `F32` is the parity target.
+    /// Numeric precision; `F32` is the parity target.
     pub precision: Precision,
     /// Attention kernel and memory budget.
     pub attention: AttentionOptions,
 }
 
 /// A loaded encoder on a device, ready to embed scans.
-#[derive(Debug)]
 pub struct Encoder {
     model: VisionTransformer,
     arch: Architecture,
@@ -75,20 +75,20 @@ impl Encoder {
         bytes: &[u8],
         options: EncoderOptions,
     ) -> Result<Self, EncoderError> {
-        let device_choice = options.device.resolve();
-        let compute = options.precision.compute_dtype();
-        let kernel = options.attention.kernel.resolve(device_choice.is_gpu(), compute);
-        let attention = AttentionOptions { kernel, ..options.attention };
-        let options = EncoderOptions { device: device_choice, attention, ..options };
-        let device = device_choice.burn_device()?;
-        if !device.supports_dtype(compute) {
+        let (device_choice, device) = options.device.open()?;
+        if device.is_cpu() && options.precision != Precision::F32 {
             return Err(EncoderError::Device(format!(
-                "{} does not support {}",
-                options.device, options.precision
+                "{} needs a GPU; use f32 on the CPU (Candle's CPU backend has no bf16 matmul, and its \
+                 f16 matmuls and softmax accumulate in f16, which misses the parity gate)",
+                options.precision
             )));
         }
+        let kernel =
+            options.attention.kernel.resolve(&device, arch.head_dim(), options.precision.compute_dtype())?;
+        let attention = AttentionOptions { kernel, ..options.attention };
+        let options = EncoderOptions { device: device_choice, attention, ..options };
         let mut weights = WeightReader::new(bytes, &device)?;
-        let model = VisionTransformer::load(arch, &mut weights, compute, options.attention)?;
+        let model = VisionTransformer::load(arch, &mut weights, options.precision)?;
         weights.finish()?;
         Ok(Self { model, arch: arch.clone(), device, options })
     }
@@ -102,8 +102,8 @@ impl Encoder {
     pub fn encode(&self, patches: &[f32], coords: &[[u16; 3]]) -> Result<Encoded, EncoderError> {
         self.check_input(patches, coords)?;
         let start = Instant::now();
-        // Burn panics rather than returning errors when a device runs out of memory or a kernel
-        // fails; turn that into an error so one bad scan does not end a batch.
+        // Candle reports failures as errors, but a few paths (assertions in its Metal backend)
+        // panic instead; turn those into errors too so one bad scan does not end a batch.
         let mut values = panic::catch_unwind(AssertUnwindSafe(|| self.forward(patches, coords)))
             .map_err(|payload| EncoderError::Backend(panic_message(payload.as_ref())))??;
         let width = self.arch.width;
@@ -116,19 +116,17 @@ impl Encoder {
     /// Upload, run and read back: `[class_tokens + N, width]` row-major.
     fn forward(&self, patches: &[f32], coords: &[[u16; 3]]) -> Result<Vec<f32>, EncoderError> {
         let n_tokens = coords.len();
-        let patch_dim = self.arch.patch_dim();
-        let patches =
-            Tensor::<2>::from_data(TensorData::new(patches.to_vec(), [n_tokens, patch_dim]), &self.device);
-        let coords = [0, 1, 2].map(|axis| {
-            let ids: Vec<i32> = coords.iter().map(|c| i32::from(c[axis])).collect();
-            Tensor::<1, Int>::from_data(TensorData::new(ids, [n_tokens]), &self.device)
-        });
-        let output = self.model.forward(patches, coords);
-        output
-            .try_into_data()
-            .map_err(|err| EncoderError::Backend(format!("{err:?}")))?
-            .try_into_vec::<f32>()
-            .map_err(|err| EncoderError::Backend(format!("{err:?}")))
+        let sequence = n_tokens + self.arch.class_tokens;
+        let plan =
+            self.options.attention.plan(self.arch.heads, sequence, self.options.precision.compute_dtype())?;
+        let patches = Tensor::from_slice(patches, (n_tokens, self.arch.patch_dim()), &self.device)?;
+        let column = |axis: usize| {
+            let ids: Vec<u32> = coords.iter().map(|c| u32::from(c[axis])).collect();
+            Tensor::from_vec(ids, n_tokens, &self.device)
+        };
+        let coords = [column(0)?, column(1)?, column(2)?];
+        let output = self.model.forward(&patches, &coords, plan)?;
+        Ok(output.flatten_all()?.to_vec1::<f32>()?)
     }
 
     /// The architecture this encoder was built for.
@@ -143,18 +141,25 @@ impl Encoder {
 
     /// Wait for all queued device work; useful before timing.
     pub fn sync(&self) -> Result<(), EncoderError> {
-        self.device.sync().map_err(|err| EncoderError::Backend(format!("{err:?}")))
+        Ok(self.device.synchronize()?)
     }
 
-    /// Bytes the device allocator holds (in use plus cached pages), where the backend reports it.
-    /// Pages are kept for reuse, so after an encode this is close to that encode's peak.
+    /// Bytes the device holds for this process right now, where the backend reports it (Metal):
+    /// the weights, plus during an encode its activations and the buffers Candle keeps for reuse.
+    /// Candle frees unused buffers whenever it waits for the GPU, so after an encode returns this
+    /// is about the weights alone; poll it during an encode to see the peak.
     pub fn device_memory_reserved(&self) -> Option<u64> {
-        self.device.memory_pool_usage().map(|usage| usage.bytes_reserved)
+        match &self.device {
+            #[cfg(target_os = "macos")]
+            Device::Metal(metal) => Some(metal.current_allocated_size() as u64),
+            _ => None,
+        }
     }
 
-    /// Ask the device allocator to return cached pages.
+    /// Ask the device to free buffers it keeps for reuse. Candle's Metal backend frees them
+    /// whenever it waits for the GPU, so this is [`Encoder::sync`] with errors ignored.
     pub fn release_cached_memory(&self) {
-        self.device.memory_cleanup();
+        let _ = self.device.synchronize();
     }
 
     fn check_input(&self, patches: &[f32], coords: &[[u16; 3]]) -> Result<(), EncoderError> {
@@ -170,6 +175,7 @@ impl Encoder {
                 patch_dim
             )));
         }
+        // the GPU would read out of bounds rather than fail, so check here
         let grid = self.arch.patch_grid();
         if let Some(bad) = coords.iter().find(|c| (0..3).any(|axis| usize::from(c[axis]) >= grid[axis])) {
             return Err(EncoderError::Input(format!(
@@ -177,6 +183,16 @@ impl Encoder {
             )));
         }
         Ok(())
+    }
+}
+
+impl fmt::Debug for Encoder {
+    // Candle's tensors print their values, so list only what identifies the encoder.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Encoder")
+            .field("arch", &self.arch)
+            .field("options", &self.options)
+            .finish_non_exhaustive()
     }
 }
 

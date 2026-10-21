@@ -5,31 +5,28 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The encoder runs on Candle. Devices:
+# - CPU: always built.
+# - Metal (Apple GPUs): always built on macOS, through the target-specific dependencies below.
+# - CUDA (NVIDIA GPUs): the `cuda` feature, for Linux.
 [features]
-# On Linux build with `--no-default-features --features flex,cuda,fusion,autotune`.
-default = ["flex", "metal", "fusion", "autotune"]
-# CPU backend (pure Rust, multithreaded, SIMD); also what the tests run on.
-flex = ["burn/flex", "burn/rayon", "burn/simd"]
-# Apple GPUs: wgpu runtime with kernels compiled to native MSL.
-metal = ["burn/metal"]
-# Any GPU through wgpu's portable WGSL path (slower than `metal` on a Mac).
-wgpu = ["burn/wgpu"]
-# NVIDIA GPUs; builds without CUDA installed, needs the driver at run time.
-cuda = ["burn/cuda"]
-# Fuse elementwise chains and reductions into fewer GPU kernels.
-fusion = ["burn/fusion"]
-# Benchmark kernel variants on first use of each shape; needed for GPU flash attention.
-autotune = ["burn/autotune"]
-# Keep autotune results on disk between runs (cubecl's cache directory).
-persistence = ["burn/persistence"]
+default = []
+# NVIDIA GPUs. Candle compiles its CUDA kernels at build time, so building with this feature needs
+# the CUDA toolkit (`nvcc`) and does not build on macOS. Build with `--features cuda` on Linux.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
 toml.workspace = true
 safetensors.workspace = true
-burn.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
 sha2 = "0.11.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]
 anyhow.workspace = true

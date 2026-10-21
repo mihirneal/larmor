@@ -1,6 +1,7 @@
 //! Comparing encoder outputs with the PyTorch references in
 //! `fixtures/reference/encode/<model_id>/<scan>.safetensors` (layout in `docs/DESIGN.md`).
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -29,6 +30,18 @@ pub struct EncodeReference {
     pub pooled_bf16: Option<Vec<f32>>,
     /// Embedding width `D`.
     pub width: usize,
+    /// The file's `__metadata__`: model id and sha256, scan, library versions, timings and the
+    /// bf16 noise floor (see [`EncodeReference::bf16_noise_floor`]).
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// How far PyTorch's own bf16 autocast lands from its fp32, as stored in a reference's metadata.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NoiseFloor {
+    /// Smallest per-token cosine of `tokens_bf16` against `tokens` (`bf16_min_token_cosine`).
+    pub min_token_cosine: f64,
+    /// Cosine of `pooled_bf16` against `pooled` (`bf16_pooled_cosine`).
+    pub pooled_cosine: f64,
 }
 
 impl EncodeReference {
@@ -37,6 +50,8 @@ impl EncodeReference {
         let path = path.as_ref();
         let bytes =
             std::fs::read(path).map_err(|source| EncoderError::Read { path: path.to_path_buf(), source })?;
+        let (_, header) = SafeTensors::read_metadata(&bytes)?;
+        let metadata = header.metadata().clone().unwrap_or_default().into_iter().collect();
         let file = SafeTensors::deserialize(&bytes)?;
         let (tokens, token_shape) = f32_tensor(&file, "tokens")?;
         let width = token_shape.get(1).copied().unwrap_or(0);
@@ -53,12 +68,23 @@ impl EncodeReference {
             tokens_bf16: optional("tokens_bf16"),
             pooled_bf16: optional("pooled_bf16"),
             width,
+            metadata,
         })
     }
 
     /// Number of tokens.
     pub fn n_tokens(&self) -> usize {
         self.coords.len()
+    }
+
+    /// PyTorch's bf16-autocast agreement with its own fp32, from the metadata that
+    /// `tools/make_reference.py::run_encode` writes. `None` if the file lacks it.
+    pub fn bf16_noise_floor(&self) -> Option<NoiseFloor> {
+        let number = |key: &str| self.metadata.get(key)?.parse::<f64>().ok();
+        Some(NoiseFloor {
+            min_token_cosine: number("bf16_min_token_cosine")?,
+            pooled_cosine: number("bf16_pooled_cosine")?,
+        })
     }
 }
 
@@ -69,8 +95,10 @@ pub struct Parity {
     pub min_token_cosine: f64,
     /// Mean per-token cosine similarity.
     pub mean_token_cosine: f64,
-    /// Smallest per-token cosine after subtracting each side's mean token. A model that ignores
-    /// its input and outputs near-constant tokens scores high on the plain cosine but not here.
+    /// Smallest per-token cosine after subtracting the reference's mean token from both sides.
+    /// Raw cosines are inflated by the component every token shares; this one measures the
+    /// token-specific part, so a model that outputs near-constant tokens scores high on the plain
+    /// cosine but not here.
     pub min_centered_cosine: f64,
     /// Mean centered cosine.
     pub mean_centered_cosine: f64,
@@ -123,8 +151,7 @@ pub fn compare_parts(
     width: usize,
 ) -> Parity {
     let token_cos = row_cosines(tokens, &reference.tokens, width);
-    let centered =
-        row_cosines(&centered_rows(tokens, width), &centered_rows(&reference.tokens, width), width);
+    let centered = centered_row_cosines(tokens, &reference.tokens, width);
     let cls_cos = row_cosines(cls, &reference.cls, width);
     let max_abs = |values: &[f32]| values.iter().fold(0f64, |m, &v| m.max(f64::from(v).abs()));
     let max_abs_diff = tokens
@@ -145,9 +172,13 @@ pub fn compare_parts(
 
 /// Cosine similarity of two vectors, in f64.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    cosine_of(a.iter().zip(b).map(|(&x, &y)| (f64::from(x), f64::from(y))))
+}
+
+/// Cosine similarity of paired components.
+fn cosine_of(pairs: impl Iterator<Item = (f64, f64)>) -> f64 {
     let (mut dot, mut aa, mut bb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(b) {
-        let (x, y) = (f64::from(x), f64::from(y));
+    for (x, y) in pairs {
         dot += x * y;
         aa += x * x;
         bb += y * y;
@@ -160,19 +191,29 @@ pub fn row_cosines(a: &[f32], b: &[f32], width: usize) -> Vec<f64> {
     a.chunks_exact(width).zip(b.chunks_exact(width)).map(|(x, y)| cosine(x, y)).collect()
 }
 
-/// Rows minus their column mean.
-fn centered_rows(values: &[f32], width: usize) -> Vec<f32> {
+/// Per-row cosines of `a − m` and `reference − m`, where `m` is the reference's mean row.
+fn centered_row_cosines(a: &[f32], reference: &[f32], width: usize) -> Vec<f64> {
+    let mean = mean_row(reference, width);
+    let centered = |v: f32, m: f64| f64::from(v) - m;
+    a.chunks_exact(width)
+        .zip(reference.chunks_exact(width))
+        .map(|(x, y)| {
+            cosine_of(x.iter().zip(y).zip(&mean).map(|((&x, &y), &m)| (centered(x, m), centered(y, m))))
+        })
+        .collect()
+}
+
+/// The mean row of a row-major `[rows, width]` matrix, in f64.
+fn mean_row(values: &[f32], width: usize) -> Vec<f64> {
     let rows = (values.len() / width).max(1) as f64;
     let mut mean = vec![0f64; width];
     for row in values.chunks_exact(width) {
         for (m, &v) in mean.iter_mut().zip(row) {
-            *m += f64::from(v) / rows;
+            *m += f64::from(v);
         }
     }
-    values
-        .chunks_exact(width)
-        .flat_map(|row| row.iter().zip(&mean).map(|(&v, &m)| (f64::from(v) - m) as f32))
-        .collect()
+    mean.iter_mut().for_each(|m| *m /= rows);
+    mean
 }
 
 fn min(values: &[f64]) -> f64 {
@@ -216,9 +257,19 @@ mod tests {
     }
 
     #[test]
-    fn centering_subtracts_the_mean_row() {
+    fn mean_row_averages_rows() {
         // rows [5, 6] and [7, 4] have mean [6, 5]
-        let centered = centered_rows(&[5.0, 6.0, 7.0, 4.0], 2);
-        assert_eq!(centered, vec![-1.0, 1.0, 1.0, -1.0]);
+        assert_eq!(mean_row(&[5.0, 6.0, 7.0, 4.0], 2), vec![6.0, 5.0]);
+    }
+
+    #[test]
+    fn centering_exposes_token_specific_error() {
+        // both tokens share a large offset, so the raw cosine stays high while the parts that
+        // differ between tokens point the opposite way
+        let reference = [100.0, 1.0, 100.0, -1.0];
+        let swapped = [100.0, -1.0, 100.0, 1.0];
+        assert!(row_cosines(&swapped, &reference, 2).iter().all(|&c| c > 0.999));
+        let centered = centered_row_cosines(&swapped, &reference, 2);
+        assert!(centered.iter().all(|&c| (c + 1.0).abs() < 1e-12), "{centered:?}");
     }
 }

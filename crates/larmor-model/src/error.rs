@@ -101,7 +101,32 @@ pub enum EncoderError {
     /// The input patches or coordinates do not fit the model.
     #[error("invalid input: {0}")]
     Input(String),
+    /// Chunked attention would need more scratch memory than its budget allows.
+    #[error(
+        "{what} needs {:.2} GiB of attention scores, over the {:.2} GiB budget \
+         (AttentionOptions::score_budget_bytes)",
+        gib(*.needed_bytes),
+        gib(*.budget_bytes)
+    )]
+    MemoryBudget {
+        /// The attention configuration, e.g. `chunked attention over 59360 tokens, 4096 query rows`.
+        what: String,
+        /// Bytes of score buffers it would hold at once.
+        needed_bytes: usize,
+        /// The budget it exceeds.
+        budget_bytes: usize,
+    },
     /// The backend failed while running or reading back results.
     #[error("backend error: {0}")]
     Backend(String),
+}
+
+impl From<candle_core::Error> for EncoderError {
+    fn from(err: candle_core::Error) -> Self {
+        EncoderError::Backend(err.to_string())
+    }
+}
+
+fn gib(bytes: usize) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
 }

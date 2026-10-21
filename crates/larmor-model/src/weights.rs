@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use burn::tensor::{Device, FloatDType, Tensor, TensorData};
+use candle_core::{DType, Device, Tensor};
 use safetensors::{Dtype, SafeTensors};
 
 use crate::error::EncoderError;
@@ -39,32 +39,48 @@ impl<'a> WeightReader<'a> {
     }
 
     /// `name` as a device tensor of the given dtype.
-    pub(crate) fn tensor<const D: usize>(
+    pub(crate) fn tensor(
         &mut self,
         name: &str,
-        shape: [usize; D],
-        dtype: FloatDType,
-    ) -> Result<Tensor<D>, EncoderError> {
-        let values = self.values(name, &shape)?;
-        Ok(self.upload(values, shape, dtype))
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<Tensor, EncoderError> {
+        let values = self.values(name, shape)?;
+        self.upload(values, shape, dtype)
     }
 
-    /// A PyTorch `nn.Linear` weight (`[out, in]`) transposed to Burn's `[in, out]` layout.
-    pub(crate) fn linear_weight(
+    /// One or more PyTorch `nn.Linear` layers with the same input, as a single `[in (+ 1), out]`
+    /// matrix for `x @ W` (`out` sums the layers' outputs, in order).
+    ///
+    /// Each weight `[out, in]` is transposed; with `bias`, each layer's bias becomes the last row,
+    /// so appending a column of ones to `x` adds the bias inside the matmul. Candle adds a
+    /// separate bias through a broadcast kernel that costs more than the matmul at these shapes;
+    /// folding it in made ViT-S about 20% faster on Metal.
+    pub(crate) fn linear(
         &mut self,
-        name: &str,
+        prefixes: &[String],
         d_in: usize,
         d_out: usize,
-        dtype: FloatDType,
-    ) -> Result<Tensor<2>, EncoderError> {
-        let torch_layout = self.values(name, &[d_out, d_in])?;
-        let mut burn_layout = vec![0.0; torch_layout.len()];
-        for (row, out_row) in torch_layout.chunks_exact(d_in).enumerate() {
-            for (col, &value) in out_row.iter().enumerate() {
-                burn_layout[col * d_out + row] = value;
+        bias: bool,
+        dtype: DType,
+    ) -> Result<Tensor, EncoderError> {
+        let width = prefixes.len() * d_out;
+        let rows = d_in + usize::from(bias);
+        let mut folded = vec![0f32; rows * width];
+        for (layer, prefix) in prefixes.iter().enumerate() {
+            let weight = self.values(&format!("{prefix}.weight"), &[d_out, d_in])?;
+            for (out, weight_row) in weight.chunks_exact(d_in).enumerate() {
+                for (row, &value) in weight_row.iter().enumerate() {
+                    folded[row * width + layer * d_out + out] = value;
+                }
+            }
+            if bias {
+                let values = self.values(&format!("{prefix}.bias"), &[d_out])?;
+                let start = d_in * width + layer * d_out;
+                folded[start..start + d_out].copy_from_slice(&values);
             }
         }
-        Ok(self.upload(burn_layout, [d_in, d_out], dtype))
+        self.upload(folded, &[rows, width], dtype)
     }
 
     /// Error if any tensor in the file was never taken.
@@ -76,15 +92,8 @@ impl<'a> WeightReader<'a> {
         }
     }
 
-    pub(crate) fn device(&self) -> &Device {
-        &self.device
-    }
-
-    fn upload<const D: usize>(&self, values: Vec<f32>, shape: [usize; D], dtype: FloatDType) -> Tensor<D> {
-        let data = TensorData::new(values, shape);
-        // persistent allocations keep weights out of the pools that activations churn through
-        self.device
-            .memory_persistent_allocations(data, |data| Tensor::from_data(data, (&self.device, dtype.into())))
+    fn upload(&self, values: Vec<f32>, shape: &[usize], dtype: DType) -> Result<Tensor, EncoderError> {
+        Ok(Tensor::from_vec(values, shape, &self.device)?.to_dtype(dtype)?)
     }
 }
 

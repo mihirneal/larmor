@@ -1,63 +1,79 @@
-//! Picking a Burn device and a compute precision.
+//! Picking a Candle device and a compute precision.
 //!
-//! Burn 0.22 puts the backend in the [`Device`] rather than in a type parameter, so choosing a
-//! backend is a runtime decision among the ones compiled in by Cargo features:
+//! Which devices exist depends on the build:
 //!
-//! | Feature | Device | Notes |
+//! | Device | Built | Attention kernel |
 //! |---|---|---|
-//! | `metal` (default) | [`DeviceChoice::Metal`] | wgpu runtime, kernels compiled to native MSL |
-//! | `wgpu` | [`DeviceChoice::Wgpu`] | wgpu runtime, WGSL (on macOS this also runs on Metal) |
-//! | `cuda` | [`DeviceChoice::Cuda`] | Linux/NVIDIA |
-//! | `flex` (default) | [`DeviceChoice::Cpu`] | pure-Rust CPU backend, used by the tests |
+//! | [`DeviceChoice::Cpu`] | always | query-chunked |
+//! | [`DeviceChoice::Metal`] | on macOS | fused `sdpa` (query-chunked for head dims it lacks) |
+//! | [`DeviceChoice::Cuda`] | with the `cuda` feature | query-chunked |
 
 use std::fmt;
+use std::panic;
 use std::str::FromStr;
 
-#[allow(unused_imports)] // which ones are used depends on the enabled backends
-use burn::tensor::{DType, Device, DeviceKind, DeviceType, FloatDType};
+use candle_core::{DType, Device};
 
 use crate::error::EncoderError;
 
 /// Which compute device runs the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceChoice {
-    /// The best compiled-in device present on this machine: CUDA, then Metal, then wgpu, then CPU.
+    /// The best device this build and machine have: CUDA, then Metal, then the CPU.
     #[default]
     Auto,
-    /// The CPU (Burn's Flex backend).
+    /// The CPU.
     Cpu,
-    /// Apple GPU through Metal (MSL kernels).
+    /// The Apple GPU, through Metal.
     Metal,
-    /// Any GPU through wgpu's portable shader path.
-    Wgpu,
-    /// NVIDIA GPU by index.
+    /// An NVIDIA GPU, by index.
     Cuda(usize),
 }
 
-/// Numeric precision of the encoder's matrix multiplies.
+/// Numeric precision of the encoder.
 ///
-/// `F32` is the parity target. The half precisions mirror PyTorch autocast, which is how
-/// nanobrain's eval framework runs: linears and attention run in the half type while the residual
-/// stream, LayerNorms and position embeddings stay in f32.
+/// `F32` is the parity target and the default, and the only precision on the CPU. The half
+/// precisions work like PyTorch autocast, which is how nanobrain's eval framework runs the model
+/// (`torch.autocast(dtype=bfloat16)`): the linears, attention and GELU run in the half type
+/// (matmuls accumulating in f32), while the residual stream, LayerNorms, position embeddings and
+/// class tokens stay in f32.
+///
+/// This mixed form was chosen over running everything in the half type (`model.half()`) from
+/// measurements on an M3 Ultra (ViT-S, Metal, fused attention). Speed is the same within noise:
+/// at patch 8 both take 0.14-0.155 s per scan, at patch 4 both 4.09-4.23 s. Parity is better
+/// mixed. Against PyTorch fp32 at patch 4, pure bf16 reaches `1 - min token cosine` 1.7e-4 and
+/// `1 - min centered cosine` 1.6e-3, against 6.8e-5 and 6.2e-4 mixed; mixed bf16 lands where
+/// PyTorch's own bf16 autocast does (6.0e-5). Mixed f16 is also closer (1.0e-6 against 1.8e-6),
+/// and an f32 residual stream cannot overflow f16's ±65504 range between blocks.
+///
+/// Half precision needs a GPU (Metal or CUDA). Candle's CPU backend has no bf16 matmul, and on
+/// Apple silicon its f16 matmuls and softmax accumulate in f16: ViT-S patch 8 then reaches a min
+/// token cosine of only 0.87 against PyTorch fp32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Precision {
     /// Everything in f32.
     #[default]
     F32,
-    /// Linears and attention in IEEE half precision.
+    /// Linears, attention and GELU in IEEE half precision; the rest in f32. GPU only.
     F16,
-    /// Linears and attention in bfloat16.
+    /// Linears, attention and GELU in bfloat16; the rest in f32. GPU only.
     Bf16,
 }
 
 impl Precision {
-    /// The dtype linears and attention compute in.
-    pub fn compute_dtype(self) -> FloatDType {
+    /// The dtype linears, attention and GELU compute in.
+    pub fn compute_dtype(self) -> DType {
         match self {
-            Precision::F32 => FloatDType::F32,
-            Precision::F16 => FloatDType::F16,
-            Precision::Bf16 => FloatDType::BF16,
+            Precision::F32 => DType::F32,
+            Precision::F16 => DType::F16,
+            Precision::Bf16 => DType::BF16,
         }
+    }
+
+    /// The dtype of the residual stream, LayerNorms, position embeddings and class tokens: f32 in
+    /// every precision, as under autocast.
+    pub fn residual_dtype(self) -> DType {
+        DType::F32
     }
 }
 
@@ -90,7 +106,6 @@ impl fmt::Display for DeviceChoice {
             DeviceChoice::Auto => f.write_str("auto"),
             DeviceChoice::Cpu => f.write_str("cpu"),
             DeviceChoice::Metal => f.write_str("metal"),
-            DeviceChoice::Wgpu => f.write_str("wgpu"),
             DeviceChoice::Cuda(index) => write!(f, "cuda:{index}"),
         }
     }
@@ -105,46 +120,58 @@ impl FromStr for DeviceChoice {
             "auto" => Ok(DeviceChoice::Auto),
             "cpu" => Ok(DeviceChoice::Cpu),
             "metal" => Ok(DeviceChoice::Metal),
-            "wgpu" => Ok(DeviceChoice::Wgpu),
             "cuda" => Ok(DeviceChoice::Cuda(0)),
             _ => match s.strip_prefix("cuda:").map(str::parse) {
                 Some(Ok(index)) => Ok(DeviceChoice::Cuda(index)),
-                _ => Err(format!("unknown device {s:?} (expected auto, cpu, metal, wgpu or cuda[:N])")),
+                _ => Err(format!("unknown device {s:?} (expected auto, cpu, metal or cuda[:N])")),
             },
         }
     }
 }
 
 impl DeviceChoice {
-    /// Resolve `Auto` to a concrete choice. Returns the first compiled-in GPU that this machine
-    /// has, or `Cpu`.
+    /// Resolve `Auto` to the device [`DeviceChoice::open`] would pick. Probes the hardware, so
+    /// it costs a device initialization.
     pub fn resolve(self) -> DeviceChoice {
-        if self != DeviceChoice::Auto {
-            return self;
+        match self.open() {
+            Ok((choice, _)) => choice,
+            Err(_) => self,
         }
-        #[cfg(feature = "cuda")]
-        if !Device::enumerate(DeviceType::Cuda).is_empty() {
-            return DeviceChoice::Cuda(0);
-        }
-        #[cfg(feature = "metal")]
-        if !Device::enumerate(DeviceType::Metal).is_empty() {
-            return DeviceChoice::Metal;
-        }
-        #[cfg(feature = "wgpu")]
-        if !Device::enumerate(DeviceType::Wgpu).is_empty() {
-            return DeviceChoice::Wgpu;
-        }
-        DeviceChoice::Cpu
     }
 
-    /// The Burn device for this choice, or an error naming the Cargo feature it needs.
-    pub fn burn_device(self) -> Result<Device, EncoderError> {
-        match self.resolve() {
-            DeviceChoice::Auto => unreachable!("resolve never returns Auto"),
-            DeviceChoice::Cpu => cpu_device(),
-            DeviceChoice::Metal => metal_device(),
-            DeviceChoice::Wgpu => wgpu_device(),
-            DeviceChoice::Cuda(index) => cuda_device(index),
+    /// The Candle device for this choice, or an error saying why it is unavailable.
+    pub fn candle_device(self) -> Result<Device, EncoderError> {
+        self.open().map(|(_, device)| device)
+    }
+
+    /// Open the device, resolving `Auto` to the first of CUDA, Metal and CPU that works.
+    pub fn open(self) -> Result<(DeviceChoice, Device), EncoderError> {
+        match self {
+            DeviceChoice::Auto => {
+                let gpu = [DeviceChoice::Cuda(0), DeviceChoice::Metal]
+                    .into_iter()
+                    .find_map(|choice| choice.open().ok());
+                Ok(gpu.unwrap_or((DeviceChoice::Cpu, Device::Cpu)))
+            }
+            DeviceChoice::Cpu => Ok((self, Device::Cpu)),
+            DeviceChoice::Metal => match Device::new_metal(0) {
+                Ok(device) => Ok((self, device)),
+                Err(_) if !cfg!(target_os = "macos") => Err(EncoderError::Device(
+                    "Metal is only available in macOS builds of larmor-model".into(),
+                )),
+                Err(err) => Err(EncoderError::Device(format!("no Metal GPU: {err}"))),
+            },
+            // cudarc panics, rather than returning an error, when it cannot load the CUDA libraries
+            DeviceChoice::Cuda(index) => match panic::catch_unwind(|| Device::new_cuda(index)) {
+                Ok(Ok(device)) => Ok((self, device)),
+                Ok(Err(_)) if !cfg!(feature = "cuda") => {
+                    Err(EncoderError::Device("larmor-model was built without the \"cuda\" feature".into()))
+                }
+                Ok(Err(err)) => Err(EncoderError::Device(format!("CUDA device {index}: {err}"))),
+                Err(_) => Err(EncoderError::Device(format!(
+                    "CUDA device {index}: the CUDA driver libraries could not be loaded"
+                ))),
+            },
         }
     }
 
@@ -154,53 +181,36 @@ impl DeviceChoice {
     }
 }
 
-fn not_compiled(feature: &str) -> EncoderError {
-    EncoderError::Device(format!("larmor-model was built without the {feature:?} feature"))
-}
-
-fn cpu_device() -> Result<Device, EncoderError> {
-    #[cfg(feature = "flex")]
-    return Ok(Device::flex());
-    #[allow(unreachable_code)]
-    Err(not_compiled("flex"))
-}
-
-fn metal_device() -> Result<Device, EncoderError> {
-    #[cfg(feature = "metal")]
-    {
-        if Device::enumerate(DeviceType::Metal).is_empty() {
-            return Err(EncoderError::Device("no Metal GPU found".into()));
-        }
-        return Ok(Device::metal(DeviceKind::DefaultDevice));
+/// The [`DeviceChoice`] a Candle device corresponds to.
+pub(crate) fn choice_of(device: &Device) -> DeviceChoice {
+    match device.location() {
+        candle_core::DeviceLocation::Cpu => DeviceChoice::Cpu,
+        candle_core::DeviceLocation::Metal { .. } => DeviceChoice::Metal,
+        candle_core::DeviceLocation::Cuda { gpu_id } => DeviceChoice::Cuda(gpu_id),
     }
-    #[allow(unreachable_code)]
-    Err(not_compiled("metal"))
 }
 
-fn wgpu_device() -> Result<Device, EncoderError> {
-    #[cfg(feature = "wgpu")]
-    {
-        if Device::enumerate(DeviceType::Wgpu).is_empty() {
-            return Err(EncoderError::Device("no wgpu adapter found".into()));
-        }
-        return Ok(Device::wgpu(DeviceKind::DefaultDevice));
-    }
-    #[allow(unreachable_code)]
-    Err(not_compiled("wgpu"))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn cuda_device(index: usize) -> Result<Device, EncoderError> {
-    #[cfg(feature = "cuda")]
-    {
-        let count = Device::enumerate(DeviceType::Cuda).len();
-        if index >= count {
-            return Err(EncoderError::Device(format!("CUDA device {index} not found ({count} present)")));
+    #[test]
+    fn names_round_trip() {
+        for choice in [DeviceChoice::Auto, DeviceChoice::Cpu, DeviceChoice::Metal, DeviceChoice::Cuda(1)] {
+            assert_eq!(choice.to_string().parse::<DeviceChoice>(), Ok(choice));
         }
-        return Ok(Device::cuda(index));
+        for precision in [Precision::F32, Precision::F16, Precision::Bf16] {
+            assert_eq!(precision.to_string().parse::<Precision>(), Ok(precision));
+        }
+        assert_eq!("cuda".parse::<DeviceChoice>(), Ok(DeviceChoice::Cuda(0)));
+        assert!("wgpu".parse::<DeviceChoice>().is_err());
     }
-    #[allow(unreachable_code)]
-    {
-        let _ = index;
-        Err(not_compiled("cuda"))
+
+    #[test]
+    fn cpu_always_opens() {
+        let (choice, device) = DeviceChoice::Cpu.open().unwrap();
+        assert_eq!(choice, DeviceChoice::Cpu);
+        assert!(device.is_cpu());
+        assert_ne!(DeviceChoice::Auto.resolve(), DeviceChoice::Auto);
     }
 }

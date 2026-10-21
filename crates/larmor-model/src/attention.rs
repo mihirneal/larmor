@@ -1,159 +1,272 @@
 //! Scaled dot-product attention over long sequences.
 //!
-//! A patch-4 scan has about 60k tokens, and its full score matrix (6 heads × 60k × 60k f32) would
-//! be about 86 GB. Both kernels here therefore split the *queries* into chunks: each chunk still
-//! takes an exact softmax over all keys, so the result equals unchunked attention, but only one
-//! chunk's scores exist at a time.
+//! nanobrain calls `F.scaled_dot_product_attention(q, k, v)` with no mask. A patch-4 scan has
+//! about 60k tokens, and the full score matrix of one layer (6 heads × 60k × 60k f32) would take
+//! 85 GB, so neither kernel here builds it:
+//!
+//! - **Fused**: Candle's `sdpa` (MLX's "steel" attention on Metal) keeps a running softmax and
+//!   never stores scores. It exists only on Metal, for head dims 32, 64, 72, 80, 96, 128 and 256
+//!   (and 512 in half precision).
+//! - **Chunked**: two matmuls and an exact softmax, a block of query rows at a time. Each block
+//!   still takes its softmax over all keys, so the result equals unchunked attention, but only
+//!   one block's scores exist at once. This runs on every device.
 
-use burn::tensor::activation::softmax;
-use burn::tensor::module::attention as burn_attention;
-use burn::tensor::ops::AttentionModuleOptions;
-use burn::tensor::{FloatDType, Tensor};
+use std::fmt;
+use std::str::FromStr;
 
-/// Query chunks are a multiple of this many rows.
+use candle_core::{DType, Device, Tensor};
+
+use crate::device::choice_of;
+use crate::error::EncoderError;
+
+/// Chunk sizes are rounded down to a multiple of this many query rows, when they can be.
 const ROW_ALIGN: usize = 64;
 
-/// How each query chunk's attention is computed.
+/// The default [`AttentionOptions::score_budget_bytes`].
+pub const DEFAULT_SCORE_BUDGET_BYTES: usize = 2 << 30;
+
+/// How attention is computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AttentionKernel {
-    /// Pick per device and precision, from measurements on an M3 Ultra (see [`Self::resolve`]).
+    /// Fused where the device and head dim support it, chunked otherwise.
     #[default]
     Auto,
-    /// Burn's attention op (`burn::tensor::module::attention`). The CPU backend runs a flash
-    /// kernel. GPU backends run flash kernels only when built with the `autotune` feature and
-    /// otherwise materialize the chunk's scores in the compute dtype.
+    /// Candle's fused `sdpa`. An error where it does not exist.
     Fused,
-    /// Two matmuls and an exact softmax written out with tensor ops (see [`explicit_attention`]).
-    Explicit,
+    /// Query-chunked matmul, softmax, matmul.
+    Chunked,
 }
 
 impl AttentionKernel {
-    /// Replace `Auto` with a concrete kernel.
-    ///
-    /// Measured on an M3 Ultra (ViT-S, patch 8, whole forward): in f32 the explicit kernel took
-    /// 0.31 s against 0.47 s fused, so f32 on a GPU is explicit. In f16 the fused op's flash kernel
-    /// was faster (0.20 s against 0.31 s), but it only exists with the `autotune` feature; without
-    /// it the fused op materializes scores with a half-precision denominator. On the CPU the fused
-    /// op is a flash kernel and about twice as fast as the explicit path.
-    pub fn resolve(self, gpu: bool, compute: FloatDType) -> AttentionKernel {
-        let half = compute != FloatDType::F32;
+    /// Replace `Auto` with the kernel used for `head_dim`-wide heads in `dtype` on `device`, and
+    /// check that an explicit `Fused` can run there.
+    pub fn resolve(self, device: &Device, head_dim: usize, dtype: DType) -> Result<Self, EncoderError> {
+        let fused_ok = fused_supported(device, head_dim, dtype);
         match self {
-            AttentionKernel::Auto if !gpu => AttentionKernel::Fused,
-            AttentionKernel::Auto if half && cfg!(feature = "autotune") => AttentionKernel::Fused,
-            AttentionKernel::Auto => AttentionKernel::Explicit,
-            concrete => concrete,
+            AttentionKernel::Auto if fused_ok => Ok(AttentionKernel::Fused),
+            AttentionKernel::Auto => Ok(AttentionKernel::Chunked),
+            AttentionKernel::Fused if !fused_ok => Err(EncoderError::Device(format!(
+                "fused attention needs Metal and a head dim of 32, 64, 72, 80, 96, 128 or 256 \
+                 (512 in half precision); this is {} with head dim {head_dim} in {dtype:?}",
+                choice_of(device)
+            ))),
+            concrete => Ok(concrete),
         }
     }
 }
 
-/// Attention kernel and memory budget.
+impl fmt::Display for AttentionKernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AttentionKernel::Auto => "auto",
+            AttentionKernel::Fused => "fused",
+            AttentionKernel::Chunked => "chunked",
+        })
+    }
+}
+
+impl FromStr for AttentionKernel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(AttentionKernel::Auto),
+            "fused" => Ok(AttentionKernel::Fused),
+            "chunked" => Ok(AttentionKernel::Chunked),
+            other => Err(format!("unknown attention kernel {other:?} (expected auto, fused or chunked)")),
+        }
+    }
+}
+
+/// Whether Candle's fused `sdpa` runs for this device, head dim and dtype (the checks in
+/// `candle_nn::ops::Sdpa::metal_fwd`).
+pub fn fused_supported(device: &Device, head_dim: usize, dtype: DType) -> bool {
+    let head_dim_ok = match head_dim {
+        32 | 64 | 72 | 80 | 96 | 128 | 256 => true,
+        512 => dtype != DType::F32,
+        _ => false,
+    };
+    device.is_metal() && head_dim_ok && matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+}
+
+/// Attention kernel and the chunked kernel's memory budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttentionOptions {
-    /// Which kernel computes each chunk.
+    /// Which kernel computes attention.
     pub kernel: AttentionKernel,
-    /// Upper bound, in bytes, on one chunk's f32 score matrix (`heads × rows × keys × 4`). The
-    /// explicit kernel holds about two such buffers at its peak. Capped at
-    /// [`MAX_SCORE_BUDGET_BYTES`].
+    /// Query rows per chunk for the chunked kernel; `None` takes as many as fit the budget.
+    pub chunk_rows: Option<usize>,
+    /// The most bytes the chunked kernel's score buffers may hold at once: the scores and their
+    /// softmax, `2 × heads × rows × tokens` values in the compute dtype. An encode whose chunks
+    /// cannot fit is refused with [`EncoderError::MemoryBudget`].
     pub score_budget_bytes: usize,
 }
 
-/// Largest per-chunk score budget. Metal refused an 8 GiB buffer on a 96 GB M3 Ultra, and
-/// budgets past 2 GiB did not speed up patch 4.
-pub const MAX_SCORE_BUDGET_BYTES: usize = 4 << 30;
-
 impl Default for AttentionOptions {
     fn default() -> Self {
-        Self { kernel: AttentionKernel::default(), score_budget_bytes: 2 << 30 }
+        Self {
+            kernel: AttentionKernel::Auto,
+            chunk_rows: None,
+            score_budget_bytes: DEFAULT_SCORE_BUDGET_BYTES,
+        }
     }
 }
 
-/// Query rows per chunk so that `heads × rows × keys` f32 scores fit in `budget_bytes`.
-///
-/// A multiple of 64, at least 64, and no more than `queries` rounded up to a multiple of 64.
-pub fn query_chunk_rows(heads: usize, queries: usize, keys: usize, budget_bytes: usize) -> usize {
-    let bytes_per_row = heads.max(1) * keys.max(1) * size_of::<f32>();
-    let rows = (budget_bytes.min(MAX_SCORE_BUDGET_BYTES) / bytes_per_row) / ROW_ALIGN * ROW_ALIGN;
-    rows.clamp(ROW_ALIGN, queries.max(1).next_multiple_of(ROW_ALIGN))
+/// A resolved attention kernel with its chunk size, fixed for one encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttentionPlan {
+    Fused,
+    Chunked { rows: usize },
 }
 
-/// `softmax(q kᵀ / √d) v` for `[batch, heads, tokens, head_dim]` inputs, with no mask, computed in
-/// query chunks.
+impl AttentionOptions {
+    /// Bytes of score buffers the chunked kernel holds with `rows`-row chunks.
+    pub fn score_bytes(heads: usize, rows: usize, tokens: usize, dtype: DType) -> usize {
+        2 * heads * rows * tokens * dtype.size_in_bytes()
+    }
+
+    /// Query rows per chunk for `tokens` queries and keys, or an error when even the requested
+    /// (or smallest) chunk exceeds the budget.
+    ///
+    /// Without `chunk_rows`, takes the most rows that fit, rounded down to a multiple of 64 when
+    /// that is at least 64, and at most `tokens`.
+    pub fn query_chunk_rows(&self, heads: usize, tokens: usize, dtype: DType) -> Result<usize, EncoderError> {
+        let row_bytes = Self::score_bytes(heads, 1, tokens, dtype).max(1);
+        let rows = match self.chunk_rows {
+            Some(rows) => rows.clamp(1, tokens.max(1)),
+            None => {
+                let fit = self.score_budget_bytes / row_bytes;
+                let aligned = if fit >= ROW_ALIGN { fit / ROW_ALIGN * ROW_ALIGN } else { fit };
+                aligned.clamp(1, tokens.max(1))
+            }
+        };
+        let needed_bytes = rows * row_bytes;
+        if needed_bytes > self.score_budget_bytes {
+            return Err(EncoderError::MemoryBudget {
+                what: format!("chunked attention over {tokens} tokens in chunks of {rows} query rows"),
+                needed_bytes,
+                budget_bytes: self.score_budget_bytes,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// The plan for one encode of `tokens` tokens (class tokens included). `Auto` is planned as
+    /// chunked; `Encoder` resolves it before this.
+    pub(crate) fn plan(
+        &self,
+        heads: usize,
+        tokens: usize,
+        dtype: DType,
+    ) -> Result<AttentionPlan, EncoderError> {
+        match self.kernel {
+            AttentionKernel::Fused => Ok(AttentionPlan::Fused),
+            AttentionKernel::Chunked | AttentionKernel::Auto => {
+                Ok(AttentionPlan::Chunked { rows: self.query_chunk_rows(heads, tokens, dtype)? })
+            }
+        }
+    }
+}
+
+/// `softmax(q kᵀ · scale) v` for `[batch, heads, tokens, head_dim]` inputs with contiguous last
+/// dims, by the plan's kernel.
 ///
 /// Mirrors `torch.nn.functional.scaled_dot_product_attention(q, k, v)` as called by
 /// `nanobrain/modules.py::Attention.forward`.
-pub fn chunked_attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, options: &AttentionOptions) -> Tensor<4> {
-    let [batch, heads, queries, head_dim] = q.dims();
-    let keys = k.dims()[2];
-    let rows = query_chunk_rows(heads, queries, keys, options.score_budget_bytes);
-    // Zero query rows pad the queries to whole chunks. They attend like any other query and their
-    // outputs are dropped; the keys are untouched, so real rows are unaffected. Equal chunks keep
-    // one kernel shape per layer (one compile, one autotune), and a multiple-of-64 row count lets
-    // the explicit kernel's elementwise passes vectorize.
-    let padding = queries.next_multiple_of(rows) - queries;
-    let q = match padding {
-        0 => q,
-        _ => Tensor::cat(
-            vec![q.clone(), Tensor::zeros([batch, heads, padding, head_dim], (&q.device(), q.dtype()))],
-            2,
-        ),
-    };
-    let attend = |q_chunk: Tensor<4>| match options.kernel {
-        AttentionKernel::Fused => fused_attention(q_chunk, k.clone(), v.clone()),
-        // `Encoder` resolves `Auto`; a direct caller gets the explicit path
-        AttentionKernel::Explicit | AttentionKernel::Auto => {
-            explicit_attention(q_chunk, k.clone(), v.clone())
+pub(crate) fn attend(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    plan: AttentionPlan,
+) -> candle_core::Result<Tensor> {
+    match plan {
+        // reads strided q, k and v directly; no copies
+        AttentionPlan::Fused => fused_attention(q, k, v, scale),
+        AttentionPlan::Chunked { rows } => {
+            chunked_attention(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, scale, rows)
         }
-    };
-    let out = match q.dims()[2] / rows {
-        1 => attend(q),
-        _ => Tensor::cat(q.split(rows, 2).into_iter().map(attend).collect(), 2),
-    };
-    match padding {
-        0 => out,
-        _ => out.narrow(2, 0, queries),
     }
 }
 
-/// Burn's attention op with its default scale, `1/√head_dim`.
-fn fused_attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>) -> Tensor<4> {
-    // an explicit `scale` would push GPU backends off the flash kernels, so leave it as the default
-    let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: false };
-    burn_attention(q, k, v, None, None, options)
-}
-
-/// Attention from tensor ops: `softmax(s) v` with the scores laid out `sᵀ = k qᵀ / √d`.
+/// `softmax(q kᵀ · scale) v` over `[batch, heads, tokens, head_dim]` tensors, `rows` query rows
+/// at a time.
 ///
-/// The scores are `[keys, queries]` so that the per-query max and sum broadcast along a leading
-/// axis: broadcasting along the last axis stops Burn's GPU kernels from vectorizing, which made the
-/// `exp(s - max)` pass about three times slower. On long sequences these passes over the score
-/// matrix are where the time goes.
-///
-/// In f32 the softmax denominator divides the `[queries, head_dim]` output instead of the scores,
-/// which saves a read and a write of the score matrix. In half precision it cannot: the
-/// unnormalized output of a near-uniform row over 60k keys is about 60k × |v|, past f16's 65504.
-/// The denominator is always accumulated in f32.
-pub fn explicit_attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>) -> Tensor<4> {
-    let compute: FloatDType = q.dtype().into();
-    let scale = 1.0 / (q.dims()[3] as f64).sqrt();
-    // Scaling q instead of the scores touches tokens × head_dim values rather than tokens × keys.
-    // For head_dim 64 the scale is 1/8, a power of two, so this is bit-identical to scaling scores.
-    let scores_t = k.matmul((q * scale).transpose()); // [batch, heads, keys, queries]
-    let max = scores_t.clone().max_dim(2);
-    let numerators = (scores_t - max).exp();
-    let denominators = numerators.clone().cast(FloatDType::F32).sum_dim(2);
-    if compute == FloatDType::F32 {
-        numerators.transpose().matmul(v) / denominators.transpose()
-    } else {
-        let weights = (numerators.cast(FloatDType::F32) / denominators).cast(compute);
-        weights.transpose().matmul(v)
+/// The softmax runs in the input dtype. Candle's Metal and CUDA softmax kernels accumulate the
+/// sum in f32; its CPU kernel sums in the input dtype, which is why `Encoder` runs only f32 on
+/// the CPU.
+pub fn chunked_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    rows: usize,
+) -> candle_core::Result<Tensor> {
+    let queries = q.dim(2)?;
+    // Scaling q touches tokens × head_dim values rather than tokens × keys. For head_dim 64 the
+    // scale is 1/8, a power of two, so this is bit-identical to scaling the scores.
+    let q = (q * scale)?;
+    let k_t = k.t()?;
+    let rows = rows.max(1);
+    let mut outputs = Vec::with_capacity(queries.div_ceil(rows));
+    for start in (0..queries).step_by(rows) {
+        let scores = q.narrow(2, start, rows.min(queries - start))?.matmul(&k_t)?;
+        let weights = candle_nn::ops::softmax_last_dim(&scores)?;
+        outputs.push(weights.matmul(v)?);
+    }
+    match outputs.len() {
+        1 => Ok(outputs.remove(0)),
+        _ => Tensor::cat(&outputs, 2),
     }
 }
 
-/// The textbook form, `softmax(q kᵀ / √d) v` with an f32 softmax; kept to check
-/// [`explicit_attention`] against.
-pub fn softmax_attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>) -> Tensor<4> {
-    let compute: FloatDType = q.dtype().into();
-    let scale = 1.0 / (q.dims()[3] as f64).sqrt();
-    let scores = (q * scale).matmul(k.transpose()).cast(FloatDType::F32);
-    softmax(scores, 3).cast(compute).matmul(v)
+/// Candle's fused attention, `softmax(q kᵀ · scale) v`; Metal only.
+pub fn fused_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
+    candle_nn::ops::sdpa(q, k, v, None, false, scale as f32, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(chunk_rows: Option<usize>, budget: usize) -> AttentionOptions {
+        AttentionOptions { chunk_rows, score_budget_bytes: budget, ..AttentionOptions::default() }
+    }
+
+    #[test]
+    fn chunk_rows_fit_the_budget() {
+        // 2 buffers x 6 heads x 60k keys x 4 bytes = 2.88 MB per query row
+        let rows = options(None, 1 << 30).query_chunk_rows(6, 60_000, DType::F32).unwrap();
+        assert_eq!(rows, 320);
+        // half precision fits twice the rows
+        assert_eq!(options(None, 1 << 30).query_chunk_rows(6, 60_000, DType::F16).unwrap(), 704);
+        // small problems are one chunk
+        assert_eq!(options(None, 1 << 30).query_chunk_rows(6, 100, DType::F32).unwrap(), 100);
+        // below 64 rows, no rounding
+        assert_eq!(options(None, 10 * 2_880_000).query_chunk_rows(6, 60_000, DType::F32).unwrap(), 10);
+    }
+
+    #[test]
+    fn over_budget_is_refused() {
+        let err = options(None, 1000).query_chunk_rows(6, 60_000, DType::F32).unwrap_err();
+        assert!(matches!(err, EncoderError::MemoryBudget { .. }), "{err}");
+        // the full 60k x 60k matrix: 2 x 6 x 60k x 60k x 4 bytes = 172.8 GB
+        let err = options(Some(60_000), 16 << 30).query_chunk_rows(6, 60_000, DType::F32).unwrap_err();
+        assert!(err.to_string().contains("160.93 GiB"), "{err}");
+        assert_eq!(options(Some(64), 1 << 30).query_chunk_rows(6, 60_000, DType::F32).unwrap(), 64);
+    }
+
+    #[test]
+    fn fused_needs_metal_and_a_supported_head_dim() {
+        assert!(!fused_supported(&Device::Cpu, 64, DType::F32));
+        let kernel = AttentionKernel::Auto.resolve(&Device::Cpu, 64, DType::F32).unwrap();
+        assert_eq!(kernel, AttentionKernel::Chunked);
+        assert!(AttentionKernel::Fused.resolve(&Device::Cpu, 64, DType::F32).is_err());
+        if let Ok(metal) = Device::new_metal(0) {
+            assert!(fused_supported(&metal, 64, DType::F32));
+            assert!(!fused_supported(&metal, 8, DType::F32));
+            assert!(!fused_supported(&metal, 512, DType::F32));
+            assert!(fused_supported(&metal, 512, DType::BF16));
+        }
+    }
 }
