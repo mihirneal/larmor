@@ -1,0 +1,41 @@
+{
+ "versions": {
+  "nanobrain": "a1bfdd1",
+  "torch": "2.14.0",
+  "numpy": "2.5.3",
+  "scipy": "1.18.1",
+  "nibabel": "5.4.2",
+  "sklearn": "1.8.0"
+ },
+ "cases": {
+  "pos1": {
+   "raises": "This solver needs samples of at least 2 classes in the data, but the data contains only one class: 0."
+  },
+  "pos6": {
+   "raises": "y_true contains only one label (0). Please provide the list of all expected class labels explicitly through the labels argument."
+  },
+  "pos7": {
+   "auroc": 0.9333333333333333,
+   "auroc_ci": [
+    0.8403663793103447,
+    0.9957303472389678
+   ],
+   "balanced_accuracy": 0.8071428571428572,
+   "balanced_accuracy_ci": [
+    0.6140638528138529,
+    0.9705882352941176
+   ],
+   "fold_C": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "n_samples": 37,
+   "embed_dim": 20,
+   "n_params": 3,
+   "embed_seconds": 0.00011025089770555496
+  }
+ }
+}

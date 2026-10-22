@@ -35,6 +35,8 @@ pub enum Stop {
     MaxIter,
     /// The line search failed with an empty memory (`ABNORMAL`).
     Abnormal,
+    /// The objective or its gradient became NaN or infinite; the point is not a minimum.
+    NonFinite,
 }
 
 /// The point where [`minimize`] stopped.
@@ -55,6 +57,9 @@ pub fn minimize(
 ) -> Minimum {
     let mut x = x0.to_vec();
     let (mut f, mut g) = objective(&x);
+    if !is_finite(f, &g) {
+        return Minimum { x, f, n_iter: 0, stop: Stop::NonFinite };
+    }
     if max_abs(&g) <= options.gtol {
         return Minimum { x, f, n_iter: 0, stop: Stop::Gradient };
     }
@@ -87,6 +92,9 @@ pub fn minimize(
         f = accepted.f;
         g = accepted.g;
         n_iter += 1;
+        if !is_finite(f, &g) {
+            return Minimum { x, f, n_iter, stop: Stop::NonFinite };
+        }
 
         // scipy's Python driver checks maxiter before the convergence tests
         if n_iter >= options.max_iter {
@@ -493,13 +501,39 @@ fn axpy(a: f64, x: &[f64], y: &mut [f64]) {
     }
 }
 
+/// The largest absolute value, NaN if any value is NaN (`f64::max` alone would drop a NaN, and a NaN
+/// gradient would then pass for a converged one).
 fn max_abs(values: &[f64]) -> f64 {
-    values.iter().fold(0.0, |m, v| m.max(v.abs()))
+    values.iter().fold(0.0, |m: f64, v| if m.is_nan() || v.is_nan() { f64::NAN } else { m.max(v.abs()) })
+}
+
+fn is_finite(f: f64, g: &[f64]) -> bool {
+    f.is_finite() && g.iter().all(|v| v.is_finite())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nan_gradient_is_not_convergence() {
+        assert!(max_abs(&[1.0, f64::NAN, 2.0]).is_nan());
+        assert_eq!(max_abs(&[-3.0, 2.0]), 3.0);
+        let options =
+            LbfgsbOptions { memory: 10, gtol: 1e-4, ftol: 1e-12, max_iter: 100, max_line_search: 20 };
+        let nan = minimize(|x| (f64::NAN, vec![f64::NAN; x.len()]), &[1.0, 2.0], &options);
+        assert_eq!(nan.stop, Stop::NonFinite);
+        // finite at the start, NaN once x leaves the unit ball
+        let blows_up = minimize(
+            |x| {
+                let r2: f64 = x.iter().map(|v| v * v).sum();
+                if r2 > 1.0 { (f64::NAN, vec![f64::NAN; 2]) } else { (-x[0], vec![-1.0, 0.0]) }
+            },
+            &[0.0, 0.0],
+            &options,
+        );
+        assert_ne!(blows_up.stop, Stop::Gradient);
+    }
 
     #[test]
     fn minimises_the_rosenbrock_function() {

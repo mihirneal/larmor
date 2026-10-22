@@ -187,7 +187,7 @@ fn bench_fits(subjects: &[SubjectPatches], args: &Args) {
         other => panic!("unknown --set {other}"),
     };
     let start = Instant::now();
-    let training = TrainingSet::new(subjects, &ids, args.ratio);
+    let training = TrainingSet::new(subjects, &ids, args.ratio).unwrap();
     println!(
         "{} training set of outer fold 0: {} subjects, {} rows ({:.1}s to build)",
         args.set,
@@ -198,7 +198,7 @@ fn bench_fits(subjects: &[SubjectPatches], args: &Args) {
     let options = SegmentationOptions::default();
     // the first use of each device kernel compiles it; do that on one subject, outside the timings
     let start = Instant::now();
-    let warm_up = TrainingSet::new(subjects, &ids[..1], args.ratio);
+    let warm_up = TrainingSet::new(subjects, &ids[..1], args.ratio).unwrap();
     fit_segmentation(&warm_up, 1e5, &options.solver, None, &args.device).unwrap();
     println!("warm-up fit on one subject: {:.1}s", start.elapsed().as_secs_f64());
     for &alpha in &options.alphas {
@@ -302,7 +302,7 @@ fn gradient_precision(subjects: &[SubjectPatches], args: &Args) {
     let folds = segmentation_folds(subjects.len()).unwrap();
     let inner = kfold(folds[0].train.len(), 5, Some(0)).unwrap();
     let ids: Vec<usize> = inner[0].train.iter().map(|&i| folds[0].train[i]).collect();
-    let training = TrainingSet::new(subjects, &ids, args.ratio);
+    let training = TrainingSet::new(subjects, &ids, args.ratio).unwrap();
     let alpha = args.alpha;
     let options = SegmentationOptions::default();
     let start = Instant::now();

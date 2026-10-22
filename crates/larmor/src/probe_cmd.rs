@@ -72,7 +72,8 @@ pub fn cmd_probe_fit(options: FitOptions) -> Result<()> {
     let entries = cached_entries(&model, &scans, &options, with_tokens)?;
 
     let fit_start = Instant::now();
-    let fit = FitInput { column: &column, table: &table, model: &model };
+    let precision = options.precision.to_string();
+    let fit = FitInput { column: &column, table: &table, model: &model, precision };
     let mut probe = match options.kind {
         Kind::Regression => fit_regression(&fit, &entries)?,
         Kind::Classification => fit_classification(&fit, &entries)?,
@@ -100,6 +101,8 @@ struct FitInput<'a> {
     column: &'a LabelColumn<'a>,
     table: &'a LabelTable,
     model: &'a Model,
+    /// The precision asked for with `--precision`.
+    precision: String,
 }
 
 impl FitInput<'_> {
@@ -108,6 +111,8 @@ impl FitInput<'_> {
         Provenance {
             model_id: self.model.id().to_string(),
             model_sha256: self.model.weights_sha256(),
+            encoder_key: self.model.manifest.encoder_key(),
+            precision: self.precision.clone(),
             preprocessing_version: self.model.prep_version.clone(),
             layer: "last".into(),
             label_names,
@@ -281,6 +286,7 @@ pub fn cmd_probe_apply(options: ApplyOptions) -> Result<()> {
     let model = Model::resolve(options.model.as_deref().unwrap_or(&meta.model_id))?;
     let source = EmbeddingSource {
         model_sha256: model.weights_sha256(),
+        encoder_key: model.manifest.encoder_key(),
         preprocessing_version: model.prep_version.clone(),
         embed_dim: model.width(),
     };

@@ -53,7 +53,7 @@ fn single_fits_reach_the_optimum() {
         let name = fit["name"].as_str().unwrap();
         let tag = name.split('.').next().unwrap();
         let ratio = fit["max_negative_ratio"].as_f64();
-        let training = TrainingSet::new(&subjects, &[0], ratio);
+        let training = TrainingSet::new(&subjects, &[0], ratio).unwrap();
         if let Some(keep) = &training.keep_ids {
             let expected: Vec<usize> =
                 reference.i64s(&format!("{tag}.keep_ids")).iter().map(|&i| i as usize).collect();

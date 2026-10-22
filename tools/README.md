@@ -42,7 +42,7 @@ nanobrain's `src/` on `sys.path` (`NANOBRAIN_SRC` overrides it) and stubs `Synth
 | `make_reference.py encode NAME --model M.toml` | `fixtures/reference/encode/<model id>/NAME.safetensors` |
 | `make_reference.py all` | both of the above for every manifest scan and `[[pair]]`, skipping outputs that are current |
 | `test_reference.py` | nothing; pytest consistency checks over the scans and every reference |
-| `reference/probe_*.py` | probe references for Phase 2 (owned by the probe work, see their docstrings) |
+| `reference/probe_*.py` | probe references for Phase 2 (owned by the probe work, see their docstrings); `probe_reference.py minority` records where scikit-learn raises on a small minority class |
 
 `fetch_fixtures.py` pins every download by sha256 and keeps existing synthetic files (`--force` rebuilds
 them, `--check` only verifies the manifest). `make_reference.py all` regenerates a prep when the scan's

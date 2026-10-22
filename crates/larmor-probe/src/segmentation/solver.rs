@@ -21,6 +21,7 @@
 //!   chunks of rows in float64. At 633k rows that keeps it within 1.4e-9 of a float64 gradient; one float32
 //!   sum over 131k-row chunks was off by 8.7e-8, more than the 1e-8 the solver stops at.
 
+use super::SegmentationError;
 use crate::device::{Device, DeviceError};
 use crate::matrix::Matrix;
 use candle_core::Tensor;
@@ -114,7 +115,7 @@ pub fn fit_logistic(
     options: &SolverOptions,
     init: Option<&LinearHead>,
     device: &Device,
-) -> Result<(LinearHead, FitStats), DeviceError> {
+) -> Result<(LinearHead, FitStats), SegmentationError> {
     let start = Instant::now();
     let problem = DeviceProblem::upload(features, targets, alpha, options, device)?;
     let theta0 = match init {
@@ -395,13 +396,13 @@ fn minimize(
     preconditioner: &Preconditioner,
     theta0: Theta,
     options: &SolverOptions,
-) -> Result<(Theta, FitStats), DeviceError> {
+) -> Result<(Theta, FitStats), SegmentationError> {
     let mut theta = theta0;
     let mut grad = problem.gradient(&theta)?;
     let mut evaluations = 1;
     let mut memory: VecDeque<(Vec<f64>, Vec<f64>, f64)> = VecDeque::with_capacity(options.history);
     let mut gamma = 1.0;
-    let mut best = max_abs(&grad);
+    let mut best = finite_max_abs(&grad)?;
     let mut stalled = 0;
     let stats = |iterations, evaluations, gradient_max, stop| FitStats {
         iterations,
@@ -436,7 +437,7 @@ fn minimize(
         }
         grad = new_grad;
 
-        let gradient_max = max_abs(&grad);
+        let gradient_max = finite_max_abs(&grad)?;
         if gradient_max <= options.gradient_tol {
             return Ok((theta, stats(iteration, evaluations, gradient_max, SolverStop::Converged)));
         }
@@ -578,8 +579,16 @@ fn axpy(a: f64, x: &[f64], y: &mut [f64]) {
     }
 }
 
+/// The largest absolute value, NaN if any value is NaN (`f64::max` alone drops NaN).
 fn max_abs(values: &[f64]) -> f64 {
-    values.iter().fold(0.0f64, |m, v| m.max(v.abs()))
+    values.iter().fold(0.0f64, |m, v| if m.is_nan() || v.is_nan() { f64::NAN } else { m.max(v.abs()) })
+}
+
+/// [`max_abs`] of a gradient, which must be finite: a NaN or infinite gradient never counts as
+/// converged.
+fn finite_max_abs(gradient: &[f64]) -> Result<f64, SegmentationError> {
+    let value = max_abs(gradient);
+    if value.is_finite() { Ok(value) } else { Err(SegmentationError::NonFinite) }
 }
 
 #[cfg(test)]

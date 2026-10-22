@@ -17,6 +17,8 @@ fn provenance(label: &str) -> Provenance {
     Provenance {
         model_id: "nanobrain-vits-p8-ref".into(),
         model_sha256: "a".repeat(64),
+        encoder_key: "e".repeat(64),
+        precision: "f32".into(),
         preprocessing_version: "b".repeat(64),
         layer: "last".into(),
         label_names: vec![label.into()],
@@ -52,10 +54,22 @@ fn regression_probe_round_trips_and_refuses_other_embeddings() {
 
     let source = EmbeddingSource {
         model_sha256: "a".repeat(64),
+        encoder_key: "e".repeat(64),
         preprocessing_version: "b".repeat(64),
         embed_dim: 384,
     };
     read.check_embeddings(&source).unwrap();
+    assert_eq!(read.metadata.precision.as_deref(), Some("f32"));
+    // same weights, but the manifest's heads or norm_eps changed: another encoder
+    let other_encoder = EmbeddingSource { encoder_key: "f".repeat(64), ..source.clone() };
+    let err = read.check_embeddings(&other_encoder).unwrap_err();
+    assert!(matches!(err, ProbeError::EncoderMismatch { .. }), "{err}");
+    // a probe written before the encoder key was recorded is still accepted
+    let mut legacy = read.clone();
+    legacy.metadata.encoder_key = None;
+    legacy.check_embeddings(&other_encoder).unwrap();
+    let text = toml::to_string(&legacy.metadata).unwrap();
+    assert!(!text.contains("encoder_key"));
     let other_model = EmbeddingSource { model_sha256: "c".repeat(64), ..source.clone() };
     assert!(matches!(read.check_embeddings(&other_model), Err(ProbeError::ModelMismatch { .. })));
     let other_prep = EmbeddingSource { preprocessing_version: "d".repeat(64), ..source.clone() };

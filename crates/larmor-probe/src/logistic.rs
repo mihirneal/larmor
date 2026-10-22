@@ -95,6 +95,17 @@ pub fn logistic_regression_cv(
     labels: &[bool],
     options: &LogisticCvOptions,
 ) -> Result<LogisticFit, FoldError> {
+    // sklearn's check_array: "Input X contains NaN"
+    if x.data().iter().any(|v| !v.is_finite()) {
+        return Err(FoldError::NonFinite);
+    }
+    // below n_inner_folds members of a class, the unshuffled inner StratifiedKFold leaves a validation
+    // fold with one class (or a training fold with none), and sklearn raises; so does this
+    let positives = labels.iter().filter(|&&l| l).count();
+    let negatives = labels.len() - positives;
+    if negatives.min(positives) < options.n_inner_folds {
+        return Err(FoldError::TooFewInClass { negatives, positives, n_splits: options.n_inner_folds });
+    }
     let x64 = x.to_f64();
     let class_weight = balanced_class_weights(labels);
     let folds = stratified_kfold(labels, options.n_inner_folds, None)?;
@@ -104,7 +115,7 @@ pub fn logistic_regression_cv(
     let mut n_iter = Vec::with_capacity(folds.len() + 1);
     for fold in &folds {
         let train = Problem::new(&x64, labels, &fold.train, class_weight);
-        let (path, iterations) = logistic_path(&train, &options.cs, None, options);
+        let (path, iterations) = logistic_path(&train, &options.cs, None, options)?;
         let test_x = x64.select_rows(&fold.test);
         let test_labels: Vec<bool> = fold.test.iter().map(|&i| labels[i]).collect();
         scores.push(
@@ -122,7 +133,7 @@ pub fn logistic_regression_cv(
         .collect();
     let all: Vec<usize> = (0..labels.len()).collect();
     let problem = Problem::new(&x64, labels, &all, class_weight);
-    let (refit, iterations) = logistic_path(&problem, &[c], Some(&coef_init), options);
+    let (refit, iterations) = logistic_path(&problem, &[c], Some(&coef_init), options)?;
     n_iter.push(iterations);
     let w = &refit[0];
     Ok(LogisticFit { c, coef: w[..x.cols()].to_vec(), intercept: w[x.cols()], scores, coefs_paths, n_iter })
@@ -230,7 +241,7 @@ fn logistic_path(
     cs: &[f64],
     init: Option<&[f64]>,
     options: &LogisticCvOptions,
-) -> (Vec<Vec<f64>>, Vec<usize>) {
+) -> Result<(Vec<Vec<f64>>, Vec<usize>), FoldError> {
     let mut w = init.map_or_else(|| vec![0.0; problem.n_features() + 1], <[f64]>::to_vec);
     let mut path = Vec::with_capacity(cs.len());
     let mut iterations = Vec::with_capacity(cs.len());
@@ -246,15 +257,22 @@ fn logistic_path(
                     max_line_search: 50,
                 };
                 let minimum = lbfgsb::minimize(|v| problem.loss_gradient(v, l2), &w, &lbfgs);
+                // finite features keep the loss finite; a NaN point must not pass for a solution
+                if minimum.stop == lbfgsb::Stop::NonFinite {
+                    return Err(FoldError::NonFinite);
+                }
                 (minimum.x, minimum.n_iter.min(options.max_iter))
             }
             LogisticSolver::Newton => newton(problem, l2, &w),
         };
+        if solution.iter().any(|v| !v.is_finite()) {
+            return Err(FoldError::NonFinite);
+        }
         w = solution;
         path.push(w.clone());
         iterations.push(n_iter);
     }
-    (path, iterations)
+    Ok((path, iterations))
 }
 
 /// Newton's method with backtracking on the same objective, until the gradient is at rounding level.
@@ -323,8 +341,9 @@ fn newton_step(problem: &Problem, l2: f64, w: &[f64], grad: &[f64]) -> DVector<f
     }
 }
 
+/// The largest absolute value, NaN if any value is NaN, so a NaN gradient never counts as converged.
 fn max_abs(values: &[f64]) -> f64 {
-    values.iter().fold(0.0f64, |m, v| m.max(v.abs()))
+    values.iter().fold(0.0f64, |m, v| if m.is_nan() || v.is_nan() { f64::NAN } else { m.max(v.abs()) })
 }
 
 fn probabilities(x: &Matrix<f64>, w: &[f64]) -> Vec<f64> {
@@ -367,6 +386,34 @@ fn argmax_first(values: &[f64]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn too_few_of_a_class_or_non_finite_features_are_refused_like_sklearn() {
+        let mut state = 1u64;
+        let mut noise = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let x = Matrix::new(34, 3, (0..34 * 3).map(|_| noise()).collect());
+        let options = LogisticCvOptions::default();
+        for (positives, ok) in [(4, false), (5, true)] {
+            let labels: Vec<bool> = (0..34).map(|i| i % 6 == 0 && i / 6 < positives).collect();
+            let result = logistic_regression_cv(&x, &labels, &options);
+            match ok {
+                true => assert!(result.is_ok()),
+                false => assert_eq!(
+                    result.unwrap_err(),
+                    FoldError::TooFewInClass { negatives: 30, positives: 4, n_splits: 5 }
+                ),
+            }
+        }
+        let labels: Vec<bool> = (0..34).map(|i| i % 2 == 0).collect();
+        let mut data = x.data().to_vec();
+        data[7] = f32::NAN;
+        let err = logistic_regression_cv(&Matrix::new(34, 3, data), &labels, &options).unwrap_err();
+        assert_eq!(err, FoldError::NonFinite);
+        assert!(max_abs(&[0.5, f64::NAN]).is_nan());
+    }
 
     #[test]
     fn balanced_weights_sum_to_n() {

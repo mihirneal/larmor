@@ -17,7 +17,7 @@ use crate::segmentation::{
     SegmentationCv, SegmentationOptions, SubjectPatches, fit_segmentation_probe, probe_binary_segmentation,
     segmentation_folds,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use toml::{Table, Value};
 
 /// Where the training embeddings and labels came from; copied into `probe.toml`.
@@ -25,6 +25,11 @@ use toml::{Table, Value};
 pub struct Provenance {
     pub model_id: String,
     pub model_sha256: String,
+    /// The encoder key of the model (weights, architecture, readout and implementation version
+    /// together; see [`ProbeMetadata::encoder_key`]).
+    pub encoder_key: String,
+    /// The precision the embeddings were computed in (`f32`, `f16`, `bf16`).
+    pub precision: String,
     pub preprocessing_version: String,
     /// "last" for the final block after the final norm.
     pub layer: String,
@@ -37,12 +42,63 @@ pub struct Provenance {
 /// The outer folds: the eval framework's, or the label table's `fold` column when it has one.
 fn outer_folds(
     fold_column: Option<&[usize]>,
+    n_samples: usize,
+    what: &str,
     default: impl FnOnce() -> Result<Vec<Fold>>,
 ) -> Result<Vec<Fold>> {
     match fold_column {
         Some(column) => Ok(folds_from_column(column)?),
-        None => default(),
+        None => {
+            // the eval framework's outer KFold(5) / StratifiedKFold(5)
+            ensure!(
+                n_samples >= OUTER_FOLDS,
+                "the eval framework's outer {OUTER_FOLDS}-fold cross-validation needs at least {OUTER_FOLDS} \
+                 {what}; found {n_samples}"
+            );
+            default()
+        }
     }
+}
+
+/// Folds of the eval framework's outer cross-validation (without a fold column).
+const OUTER_FOLDS: usize = 5;
+
+/// Fails, naming the row, when any feature is NaN or infinite. scikit-learn and torch raise on
+/// such input ("Input X contains NaN"); a non-finite embedding comes from an encoder overflow or a
+/// damaged cache entry.
+pub fn ensure_finite(features: &Matrix<f32>, what: &str) -> Result<()> {
+    if let Some((row, values)) =
+        features.iter_rows().enumerate().find(|(_, r)| r.iter().any(|v| !v.is_finite()))
+    {
+        let column = values.iter().position(|v| !v.is_finite()).unwrap_or(0);
+        bail!("{what} row {row} has a non-finite value ({} in column {column})", values[column]);
+    }
+    Ok(())
+}
+
+/// Fails where scikit-learn's `LogisticRegressionCV` would: when a training set (an outer fold's,
+/// or all samples for the deployable probe) has fewer than `n_inner` samples of a class, its inner
+/// unshuffled `StratifiedKFold(n_inner)` leaves a validation fold with one class, and sklearn
+/// raises ("y_true contains only one label", or "This solver needs samples of at least 2
+/// classes" when a class is missing from training altogether).
+fn check_class_counts(labels: &[bool], folds: &[Fold], n_inner: usize) -> Result<()> {
+    let counts = |ids: &mut dyn Iterator<Item = usize>| {
+        ids.fold((0usize, 0usize), |(neg, pos), i| if labels[i] { (neg, pos + 1) } else { (neg + 1, pos) })
+    };
+    let rule = |neg: usize, pos: usize| {
+        format!(
+            "{neg} negative and {pos} positive samples; LogisticRegressionCV's inner StratifiedKFold({n_inner}) \
+             needs at least {n_inner} of each class (scikit-learn raises here, so the eval framework has no \
+             numbers for this split)"
+        )
+    };
+    for (k, fold) in folds.iter().enumerate() {
+        let (neg, pos) = counts(&mut fold.train.iter().copied());
+        ensure!(neg.min(pos) >= n_inner, "outer fold {k} trains on {}", rule(neg, pos));
+    }
+    let (neg, pos) = counts(&mut (0..labels.len()));
+    ensure!(neg.min(pos) >= n_inner, "the deployable probe trains on {}", rule(neg, pos));
+    Ok(())
 }
 
 /// Regression probe: `probe_regression`'s CV, then `StandardScaler + RidgeCV` on all samples.
@@ -59,7 +115,9 @@ pub fn fit_regression_probe(
         targets.len()
     );
     ensure!(targets.iter().all(|t| t.is_finite()), "regression targets must be finite");
-    let folds = outer_folds(fold_column, || Ok(regression_folds(targets.len())?))?;
+    ensure_finite(features, "feature")?;
+    let folds =
+        outer_folds(fold_column, targets.len(), "labelled samples", || Ok(regression_folds(targets.len())?))?;
     let cv = probe_regression(features, targets, &folds);
     let model = RegressionModel::fit(features, targets);
     let report = &cv.report;
@@ -90,7 +148,10 @@ pub fn fit_classification_probe(
 ) -> Result<(Probe, ClassificationCv)> {
     ensure!(features.rows() == labels.len(), "{} feature rows for {} labels", features.rows(), labels.len());
     ensure!(labels.iter().any(|&l| l) && labels.iter().any(|&l| !l), "classification needs both classes");
-    let folds = outer_folds(fold_column, || Ok(classification_folds(labels)?))?;
+    ensure_finite(features, "feature")?;
+    let folds =
+        outer_folds(fold_column, labels.len(), "labelled samples", || Ok(classification_folds(labels)?))?;
+    check_class_counts(labels, &folds, options.n_inner_folds)?;
     let cv = probe_binary_classification(features, labels, &folds, options)?;
     let model = ClassificationModel::fit(features, labels, options)?;
     let report = &cv.report;
@@ -131,9 +192,29 @@ pub fn fit_segmentation_probe_file(
     device: &Device,
 ) -> Result<(Probe, SegmentationCv)> {
     ensure!(!subjects.is_empty(), "no subjects");
-    let folds = outer_folds(fold_column, || Ok(segmentation_folds(subjects.len())?))?;
-    let cv = probe_binary_segmentation(subjects, &folds, options, device)?;
-    let (model, _, _) = fit_segmentation_probe(subjects, options, device)?;
+    for (i, subject) in subjects.iter().enumerate() {
+        ensure_finite(&subject.features, &format!("subject {i}: patch token"))?;
+    }
+    let positives: usize = subjects.iter().map(|s| s.labels.data().iter().filter(|&&v| v > 0).count()).sum();
+    ensure!(
+        positives > 0,
+        "no subject has a labelled voxel inside its in-mask patches, so there is nothing to segment"
+    );
+    let folds =
+        outer_folds(fold_column, subjects.len(), "subjects", || Ok(segmentation_folds(subjects.len())?))?;
+    for (k, fold) in folds.iter().enumerate() {
+        ensure!(
+            fold.train.len() >= options.n_inner_folds,
+            "outer fold {k} trains on {} subjects; the inner KFold({}) that picks the penalty and threshold \
+             needs at least {}",
+            fold.train.len(),
+            options.n_inner_folds,
+            options.n_inner_folds
+        );
+    }
+    let mut cv = probe_binary_segmentation(subjects, &folds, options, device)?;
+    let (model, selection, _) = fit_segmentation_probe(subjects, options, device)?;
+    cv.stops.extend(selection.stops);
     let report = &cv.report;
     let mut table = Table::new();
     table.insert("n_folds".into(), Value::Integer(folds.len() as i64));
@@ -175,6 +256,8 @@ fn new_probe(
         kind: weights.kind(),
         model_id: provenance.model_id.clone(),
         model_sha256: provenance.model_sha256.clone(),
+        encoder_key: Some(provenance.encoder_key.clone()),
+        precision: Some(provenance.precision.clone()),
         preprocessing_version: provenance.preprocessing_version.clone(),
         layer: provenance.layer.clone(),
         pooling: pooling.into(),

@@ -5,6 +5,7 @@
     tools/.venv/bin/python tools/reference/probe_reference.py segmentation --ratio 10    # -> fixtures/reference/probes/
     tools/.venv/bin/python tools/reference/probe_reference.py segmentation --ratio none
     tools/.venv/bin/python tools/reference/probe_reference.py fit              # -> crates/larmor-probe/tests/data/
+    tools/.venv/bin/python tools/reference/probe_reference.py minority         # -> crates/larmor-probe/tests/data/
 
 A fake Encoder returns features we choose: the sample index is written into voxel (0, 0, 0) of each 192x240x192
 image and the encoder looks its features up. probe_regression, probe_binary_classification and
@@ -284,6 +285,39 @@ def run_classification(out_dir: Path):
         },
     }
     write(out_dir, "probe_classification", arrays, info)
+
+
+def run_minority(out_dir: Path):
+    """probe_binary_classification with 30 negatives and 1, 6 or 7 positives.
+
+    With fewer than 5 positives in an outer training fold (6 or fewer overall under the outer
+    StratifiedKFold(5)), LogisticRegressionCV's unshuffled inner StratifiedKFold(5) leaves a validation fold
+    without positives and sklearn raises; with 7 it runs. Records the error or the numbers.
+    """
+    arrays, info = {}, {"cases": {}}
+    for n_pos in (1, 6, 7):
+        rng = np.random.default_rng(0)
+        n_neg, dim = 30, 20
+        labels = np.r_[np.zeros(n_neg, dtype=np.int64), np.ones(n_pos, dtype=np.int64)]
+        shift = np.zeros((len(labels), 4))
+        shift[:, 0] = 1.2 * labels
+        features, _ = latent_features(rng, len(labels), dim, n_factors=4, shift=shift)
+        name = f"pos{n_pos}"
+        arrays[f"{name}.features"] = features
+        arrays[f"{name}.labels"] = labels
+        try:
+            result, _ = probe.probe_binary_classification(
+                TableEncoder(features), GlobalDataset(labels, "label"), image_key="image", label_key="label",
+                **RUN_ARGS,
+            )
+        except ValueError as err:
+            info["cases"][name] = {"raises": str(err)}
+            print(name, "raises:", str(err)[:90])
+            continue
+        arrays[f"{name}.probabilities"] = np.asarray(result["probabilities"])
+        info["cases"][name] = {k: v for k, v in result.items() if k not in ("labels", "probabilities")}
+        print(name, "auroc", result["auroc"], "fold_C", result["fold_C"])
+    write(out_dir, "probe_minority", arrays, info)
 
 
 def logistic_cv(**overrides):
@@ -785,7 +819,7 @@ def run_fit(out_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("kind", choices=["regression", "classification", "segmentation", "fit"])
+    parser.add_argument("kind", choices=["regression", "classification", "segmentation", "fit", "minority"])
     parser.add_argument("--ratio", default="10", help="max_negative_ratio for segmentation, or 'none'")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -797,6 +831,8 @@ def main():
         run_classification(args.out or TEST_DATA)
     elif args.kind == "fit":
         run_fit(args.out or TEST_DATA)
+    elif args.kind == "minority":
+        run_minority(args.out or TEST_DATA)
     else:
         ratio = None if args.ratio.lower() == "none" else float(args.ratio)
         run_segmentation(args.out or FIXTURE_DIR, ratio)

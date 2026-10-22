@@ -17,6 +17,7 @@ use safetensors::tensor::{Dtype, TensorView};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -65,6 +66,15 @@ pub struct ProbeMetadata {
     pub model_id: String,
     /// SHA-256 of the encoder weights; embeddings from other weights are refused.
     pub model_sha256: String,
+    /// The model's encoder key (`larmor_model::Manifest::encoder_key`: weights, every
+    /// `[architecture]` and `[readout]` value and the encoder implementation version). Embeddings
+    /// from an encoder with another key are refused even when the weights are the same (a
+    /// corrected `heads` or `norm_eps`, say). Absent in probes written before larmor recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_key: Option<String>,
+    /// Precision of the training embeddings (`f32`, `f16` or `bf16`). Absent in older probes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<String>,
     /// Preprocessing version of the embeddings it was trained on; others are refused.
     pub preprocessing_version: String,
     /// Which encoder output: "last" is the last block after the final norm.
@@ -118,6 +128,8 @@ impl ProbeWeights {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddingSource {
     pub model_sha256: String,
+    /// The encoder key (see [`ProbeMetadata::encoder_key`]).
+    pub encoder_key: String,
     pub preprocessing_version: String,
     pub embed_dim: usize,
 }
@@ -127,10 +139,20 @@ pub struct EmbeddingSource {
 pub enum ProbeError {
     #[error("probe was trained on model weights {probe}, but the embeddings come from {embeddings}")]
     ModelMismatch { probe: String, embeddings: String },
+    #[error(
+        "probe was trained on embeddings of encoder {probe}, but this model's encoder is {embeddings} (same \
+         weights, but another architecture, readout or encoder version: a manifest value such as heads or \
+         norm_eps changed); fit the probe again"
+    )]
+    EncoderMismatch { probe: String, embeddings: String },
     #[error("probe was trained with preprocessing {probe}, but the embeddings were made with {embeddings}")]
     PreprocessingMismatch { probe: String, embeddings: String },
     #[error("probe expects {probe}-dimensional embeddings, got {embeddings}")]
     DimensionMismatch { probe: usize, embeddings: usize },
+    #[error(
+        "{what} {row} has a non-finite value; the embeddings are damaged (encoder overflow or a bad cache entry)"
+    )]
+    NonFinite { what: &'static str, row: usize },
     #[error("probe kind is {probe:?}; this prediction needs {wanted:?}")]
     WrongKind { probe: ProbeKind, wanted: ProbeKind },
     #[error("weights file {path} has sha256 {actual}, probe.toml expects {expected}")]
@@ -157,6 +179,10 @@ pub struct Probe {
 impl Probe {
     /// Writes `toml_path` and the weights file next to it (`probe.safetensors` for `probe.toml`), filling in
     /// the metadata's `weights`, `weights_sha256`, `kind`, `embed_dim` and `format`.
+    ///
+    /// Each file is written atomically (a synced temporary file renamed into place), the weights
+    /// first: an interrupted write leaves the previous probe, or new weights that the old
+    /// `probe.toml` refuses by their checksum, never a truncated file.
     pub fn write(&mut self, toml_path: &Path) -> Result<(), ProbeError> {
         let weights_path = toml_path.with_extension("safetensors");
         let bytes = serialize_weights(&self.weights)?;
@@ -202,6 +228,14 @@ impl Probe {
                 embeddings: source.model_sha256.clone(),
             });
         }
+        if let Some(key) = &metadata.encoder_key
+            && *key != source.encoder_key
+        {
+            return Err(ProbeError::EncoderMismatch {
+                probe: key.clone(),
+                embeddings: source.encoder_key.clone(),
+            });
+        }
         if metadata.preprocessing_version != source.preprocessing_version {
             return Err(ProbeError::PreprocessingMismatch {
                 probe: metadata.preprocessing_version.clone(),
@@ -221,6 +255,7 @@ impl Probe {
     /// probability of the positive class.
     pub fn predict_scans(&self, pooled: &Matrix<f32>) -> Result<Vec<f64>, ProbeError> {
         self.check_width(pooled.cols())?;
+        check_finite(pooled, "pooled embedding")?;
         match &self.weights {
             ProbeWeights::Regression(model) => Ok(model.predict(pooled)),
             ProbeWeights::Classification(model) => Ok(model.predict_proba(pooled)),
@@ -238,6 +273,7 @@ impl Probe {
         device: &Device,
     ) -> Result<(Vec<f32>, f32), ProbeError> {
         self.check_width(tokens.cols())?;
+        check_finite(tokens, "patch token")?;
         match &self.weights {
             ProbeWeights::Segmentation(model) => {
                 let threshold = model.threshold.ok_or_else(|| ProbeError::Weights("no threshold".into()))?;
@@ -260,8 +296,28 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Fails on the first row with a NaN or infinite value.
+fn check_finite(rows: &Matrix<f32>, what: &'static str) -> Result<(), ProbeError> {
+    match rows.iter_rows().position(|row| row.iter().any(|v| !v.is_finite())) {
+        Some(row) => Err(ProbeError::NonFinite { what, row }),
+        None => Ok(()),
+    }
+}
+
+/// Writes through a synced, uniquely named temporary file in the same folder and a rename, so the
+/// file is either the old one or the complete new one.
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), ProbeError> {
-    std::fs::write(path, bytes).map_err(|source| ProbeError::Io { path: path.to_path_buf(), source })
+    let io_err = |source| ProbeError::Io { path: path.to_path_buf(), source };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut tmp =
+        tempfile::Builder::new().prefix(".probe.").suffix(".tmp").tempfile_in(dir).map_err(io_err)?;
+    tmp.write_all(bytes).map_err(io_err)?;
+    tmp.as_file().sync_all().map_err(io_err)?;
+    tmp.persist(path).map_err(|e| io_err(e.error))?;
+    Ok(())
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, ProbeError> {

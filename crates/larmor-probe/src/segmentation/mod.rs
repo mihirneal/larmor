@@ -108,6 +108,16 @@ pub enum SegmentationError {
     Folds(#[from] FoldError),
     #[error(transparent)]
     Device(#[from] DeviceError),
+    /// `subsample_negatives` kept no rows: the training subjects have no positive patch, so with a
+    /// `max_negative_ratio` nothing is left to fit (nanobrain's fit_logistic raises a RuntimeError).
+    #[error(
+        "a training set has no patch with a labelled voxel, so max_negative_ratio keeps no rows to fit \
+         (the eval framework fails here too); give more subjects labels or leave out --max-negative-ratio"
+    )]
+    EmptyTrainingSet,
+    /// The solver's gradient became NaN or infinite.
+    #[error("the segmentation fit diverged: its gradient is not finite (non-finite features?)")]
+    NonFinite,
 }
 
 /// The outer folds of probe_binary_segmentation: `KFold(5, shuffle=True, random_state=0)` over subjects.
@@ -150,11 +160,16 @@ pub struct TrainingSet {
 
 impl TrainingSet {
     /// The first lines of `fit_predict_segmentation`: concatenate the subjects' patches, then
-    /// `subsample_negatives` when a ratio is given.
-    pub fn new(subjects: &[SubjectPatches], ids: &[usize], max_negative_ratio: Option<f64>) -> Self {
+    /// `subsample_negatives` when a ratio is given. A set left without rows is an error, as it is
+    /// for nanobrain.
+    pub fn new(
+        subjects: &[SubjectPatches],
+        ids: &[usize],
+        max_negative_ratio: Option<f64>,
+    ) -> Result<Self, SegmentationError> {
         let features = concat_rows(ids.iter().map(|&i| &subjects[i].features));
         let labels = concat_rows(ids.iter().map(|&i| &subjects[i].labels));
-        match max_negative_ratio {
+        let set = match max_negative_ratio {
             None => Self { features, labels, keep_ids: None },
             Some(ratio) => {
                 let keep = subsample_negatives(&labels, ratio);
@@ -164,7 +179,11 @@ impl TrainingSet {
                     keep_ids: Some(keep),
                 }
             }
+        };
+        if set.features.rows() == 0 {
+            return Err(SegmentationError::EmptyTrainingSet);
         }
+        Ok(set)
     }
 }
 
@@ -230,7 +249,7 @@ pub fn fit_segmentation(
     solver: &SolverOptions,
     init: Option<&LinearHead>,
     device: &Device,
-) -> Result<(SegmentationModel, FitStats), DeviceError> {
+) -> Result<(SegmentationModel, FitStats), SegmentationError> {
     let (mean, std) = feature_moments(&training.features);
     let standardized = standardize(&training.features, &mean, &std);
     let (head, stats) = fit_logistic(&standardized, &training.labels, alpha, solver, init, device)?;
@@ -360,6 +379,9 @@ pub struct Selection {
     pub threshold_id: usize,
     /// `[alpha][threshold]`: Dice averaged over the inner validation subjects.
     pub mean_inner_dice: Vec<Vec<f32>>,
+    /// Why each inner fit's solver stopped.
+    #[serde(default)]
+    pub stops: Vec<SolverStop>,
 }
 
 /// Where in the cross-validation a fit happened.
@@ -397,12 +419,14 @@ pub fn select_alpha_threshold(
     let (n_alphas, n_thresholds) = (options.alphas.len(), options.thresholds.len());
     // inner_dice[alpha][subject][threshold], filled for the subjects of train_ids
     let mut inner_dice = vec![vec![vec![0.0f32; n_thresholds]; subjects.len()]; n_alphas];
+    let mut stops = Vec::new();
     for (inner, split) in kfold(train_ids.len(), options.n_inner_folds, Some(CV_SEED))?.iter().enumerate() {
         let inner_train: Vec<usize> = split.train.iter().map(|&i| train_ids[i]).collect();
         let inner_val: Vec<usize> = split.test.iter().map(|&i| train_ids[i]).collect();
-        let training = TrainingSet::new(subjects, &inner_train, options.max_negative_ratio);
+        let training = TrainingSet::new(subjects, &inner_train, options.max_negative_ratio)?;
         let fits = fit_all_alphas(&training, options, device)?;
         for (alpha_id, (model, stats)) in fits.into_iter().enumerate() {
+            stops.push(stats.stop);
             let probabilities = inner_val
                 .iter()
                 .map(|&subject| model.predict(&subjects[subject].features, device))
@@ -447,7 +471,7 @@ pub fn select_alpha_threshold(
             }
         }
     }
-    Ok(Selection { alpha_id: best.0, threshold_id: best.1, mean_inner_dice })
+    Ok(Selection { alpha_id: best.0, threshold_id: best.1, mean_inner_dice, stops })
 }
 
 /// One fit per penalty on the same training set, largest penalty first when warm-starting.
@@ -455,7 +479,7 @@ fn fit_all_alphas(
     training: &TrainingSet,
     options: &SegmentationOptions,
     device: &Device,
-) -> Result<Vec<(SegmentationModel, FitStats)>, DeviceError> {
+) -> Result<Vec<(SegmentationModel, FitStats)>, SegmentationError> {
     let mut fits: Vec<Option<(SegmentationModel, FitStats)>> = vec![None; options.alphas.len()];
     let mut order: Vec<usize> = (0..options.alphas.len()).collect();
     if options.warm_start {
@@ -545,6 +569,9 @@ pub struct SegmentationReport {
 pub struct SegmentationCv {
     pub report: SegmentationReport,
     pub selections: Vec<Selection>,
+    /// Why every fit's solver stopped (inner and outer; `fit_segmentation_probe_file` adds the
+    /// deployable probe's).
+    pub stops: Vec<SolverStop>,
     /// Out-of-fold voxel probabilities per subject, `[n_patches * voxels]` row-major.
     pub probabilities: Vec<Vec<f32>>,
     pub subject_fold: Vec<usize>,
@@ -566,12 +593,15 @@ pub fn probe_binary_segmentation(
     let mut subject_fold = vec![0usize; n];
     let mut selections = Vec::with_capacity(folds.len());
     let mut fits = Vec::new();
+    let mut stops = Vec::new();
     for (fold_index, fold) in folds.iter().enumerate() {
         let selection =
             select_alpha_threshold(subjects, &fold.train, Some(fold_index), options, device, &mut fits)?;
+        stops.extend(&selection.stops);
         let alpha = options.alphas[selection.alpha_id];
-        let training = TrainingSet::new(subjects, &fold.train, options.max_negative_ratio);
+        let training = TrainingSet::new(subjects, &fold.train, options.max_negative_ratio)?;
         let (mut model, stats) = fit_segmentation(&training, alpha, &options.solver, None, device)?;
+        stops.push(stats.stop);
         model.threshold = Some(options.thresholds[selection.threshold_id]);
         let fold_probabilities = fold
             .test
@@ -629,7 +659,7 @@ pub fn probe_binary_segmentation(
         n_samples: n,
         embed_dim: subjects.first().map_or(0, |s| s.features.cols()),
     };
-    Ok(SegmentationCv { report, selections, probabilities, subject_fold, fits })
+    Ok(SegmentationCv { report, selections, stops, probabilities, subject_fold, fits })
 }
 
 /// The deployable segmentation probe: penalty and threshold by inner CV over all subjects, then a fit on all.
@@ -640,10 +670,11 @@ pub fn fit_segmentation_probe(
 ) -> Result<(SegmentationModel, Selection, Vec<FitRecord>), SegmentationError> {
     let all: Vec<usize> = (0..subjects.len()).collect();
     let mut records = Vec::new();
-    let selection = select_alpha_threshold(subjects, &all, None, options, device, &mut records)?;
-    let training = TrainingSet::new(subjects, &all, options.max_negative_ratio);
+    let mut selection = select_alpha_threshold(subjects, &all, None, options, device, &mut records)?;
+    let training = TrainingSet::new(subjects, &all, options.max_negative_ratio)?;
     let (mut model, stats) =
         fit_segmentation(&training, options.alphas[selection.alpha_id], &options.solver, None, device)?;
+    selection.stops.push(stats.stop);
     model.threshold = Some(options.thresholds[selection.threshold_id]);
     if options.record_fits {
         records.push(FitRecord {

@@ -10,11 +10,18 @@ pub struct Fold {
     pub test: Vec<usize>,
 }
 
-/// Why folds could not be built.
+/// Why folds could not be built, or a cross-validated fit cannot run on them.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FoldError {
     #[error("cannot split {n_samples} samples into {n_splits} folds")]
     TooFewSamples { n_samples: usize, n_splits: usize },
+    #[error(
+        "{n_splits}-fold stratified cross-validation needs at least {n_splits} samples of each class; got \
+         {negatives} negative and {positives} positive (scikit-learn raises here)"
+    )]
+    TooFewInClass { negatives: usize, positives: usize, n_splits: usize },
+    #[error("the features contain NaN or infinite values (scikit-learn raises \"Input X contains NaN\")")]
+    NonFinite,
     #[error("n_splits={n_splits} is greater than the number of members in every class")]
     TooFewMembers { n_splits: usize },
     #[error("fold column must hold every fold id from 0 to {max}, but fold {missing} is empty")]
