@@ -182,7 +182,10 @@ fn models_list_verify_and_download() {
         out.lines().any(|l| l.starts_with("remote ") && l.contains("missing") && l.contains("download")),
         "{out}"
     );
-    let out = ws.ok(&["models", "download", "remote"]);
+    // plain http needs --allow-http
+    let err = ws.fails(&["models", "download", "remote"]);
+    assert!(err.contains("--allow-http"), "{err}");
+    let out = ws.ok(&["models", "download", "remote", "--allow-http"]);
     assert!(out.contains("verified"), "{out}");
     assert_eq!(common::sha256_hex(&std::fs::read(models.join("remote.safetensors")).unwrap()), sha);
     assert!(ws.ok(&["models", "verify"]).lines().filter(|l| l.contains(" ok ")).count() == 2);

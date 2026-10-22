@@ -102,6 +102,12 @@ enum ModelsCmd {
     Download {
         /// Model id or path to a model.toml.
         id: String,
+        /// Replace an existing weights file whose SHA-256 does not match the manifest.
+        #[arg(long)]
+        force: bool,
+        /// Accept a plain http:// weights.url (https is required otherwise).
+        #[arg(long)]
+        allow_http: bool,
     },
 }
 
@@ -209,7 +215,9 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::Models { action } => match action.unwrap_or(ModelsCmd::List) {
             ModelsCmd::List => models_cmd::cmd_list(),
             ModelsCmd::Verify { id } => models_cmd::cmd_verify(id.as_deref()),
-            ModelsCmd::Download { id } => models_cmd::cmd_download(&id),
+            ModelsCmd::Download { id, force, allow_http } => {
+                models_cmd::cmd_download(&models_cmd::DownloadOptions { id, force, allow_http })
+            }
         },
         Cmd::Probe { action: ProbeCmd::Fit(args) } => probe_cmd::cmd_probe_fit(probe_cmd::FitOptions {
             labels: args.labels,

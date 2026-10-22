@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use larmor_model::Manifest;
 use rayon::prelude::*;
+use ureq::http::Uri;
 
 use crate::console::{bold, dim, green, red, secs, yellow};
 use crate::hashing::sha256_file;
@@ -154,14 +155,37 @@ pub fn cmd_verify(id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Options of `larmor models download`.
+pub struct DownloadOptions {
+    pub id: String,
+    /// Replace an existing weights file whose SHA-256 does not match the manifest.
+    pub force: bool,
+    /// Accept a plain `http://` URL.
+    pub allow_http: bool,
+}
+
 /// `larmor models download ID`: fetch `weights.url` to the manifest's weights path and verify it.
-pub fn cmd_download(id: &str) -> Result<()> {
-    let model = Model::resolve(id)?;
+pub fn cmd_download(options: &DownloadOptions) -> Result<()> {
+    let model = Model::resolve(&options.id)?;
     let manifest = &model.manifest;
     let dest = manifest.weights_path();
-    if WeightsStatus::of(manifest) == WeightsStatus::Ok {
-        println!("{} {} is already present and verified ({})", green("✓"), manifest.id, dest.display());
-        return Ok(());
+    match WeightsStatus::of(manifest) {
+        WeightsStatus::Ok => {
+            println!("{} {} is already present and verified ({})", green("✓"), manifest.id, dest.display());
+            return Ok(());
+        }
+        WeightsStatus::Missing => {}
+        WeightsStatus::Mismatch(actual) if !options.force => bail!(
+            "{} exists, but its sha256 is {actual}, not the {} that {} names; refusing to replace it (pass \
+             --force to replace it with the download)",
+            dest.display(),
+            manifest.weights.sha256,
+            model.path.display()
+        ),
+        WeightsStatus::Unreadable(err) if !options.force => {
+            bail!("{} exists but cannot be read ({err}); pass --force to replace it", dest.display())
+        }
+        _ => {}
     }
     let url = manifest.weights.url.trim();
     if url.is_empty() {
@@ -171,10 +195,13 @@ pub fn cmd_download(id: &str) -> Result<()> {
             dest.display()
         );
     }
+    let url = download_url(url, options.allow_http)
+        .with_context(|| format!("{}: weights.url", model.path.display()))?;
+    check_inside(&dest, &manifest.dir)?;
     println!("{} {} → {}", bold("downloading"), url, dest.display());
     let start = Instant::now();
     let part = dest.with_extension("part");
-    let bytes = download(url, &part).inspect_err(|_| {
+    let bytes = download(&url, &part).inspect_err(|_| {
         let _ = std::fs::remove_file(&part);
     })?;
     let actual = sha256_file(&part)?;
@@ -197,16 +224,57 @@ pub fn cmd_download(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The URL to fetch: `https://` (or `http://` with `allow_http`), with no user name or password in
+/// it. A bare `hf.co` host becomes `huggingface.co`, where `hf.co` redirects: the bearer token is
+/// not sent on across a redirect to another host, so gated files would fail through `hf.co`.
+fn download_url(url: &str, allow_http: bool) -> Result<String> {
+    let uri: Uri = url.parse().with_context(|| format!("{url:?} is not a valid URL"))?;
+    let scheme = uri.scheme_str().unwrap_or("").to_ascii_lowercase();
+    match scheme.as_str() {
+        "https" => {}
+        "http" if allow_http => {}
+        "http" => bail!("{url} is plain http; use an https:// URL (or pass --allow-http)"),
+        _ => bail!("{url}: only https:// URLs are downloaded"),
+    }
+    let authority = uri.authority().with_context(|| format!("{url} has no host"))?;
+    if authority.as_str().contains('@') {
+        bail!("{url} has a user name or password before its host; larmor refuses such URLs");
+    }
+    let host = authority.host().to_ascii_lowercase();
+    if host == "hf.co" {
+        let rest = uri.path_and_query().map_or("/", |p| p.as_str());
+        let port = authority.port().map_or_else(String::new, |p| format!(":{p}"));
+        return Ok(format!("{scheme}://huggingface.co{port}{rest}"));
+    }
+    Ok(url.to_string())
+}
+
+/// Refuses a destination outside the manifest's folder (the manifest check already requires a
+/// plain file name; this guards the folder itself, through symlinks too).
+fn check_inside(dest: &Path, manifest_dir: &Path) -> Result<()> {
+    let dir = if manifest_dir.as_os_str().is_empty() { Path::new(".") } else { manifest_dir };
+    let canonical_dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let canonical_parent =
+        std::fs::canonicalize(parent).with_context(|| format!("resolving {}", parent.display()))?;
+    if canonical_parent != canonical_dir {
+        bail!("{} is not in the manifest's folder {}", dest.display(), dir.display());
+    }
+    Ok(())
+}
+
+/// The `Authorization` header for `url`: `HF_TOKEN` as a bearer token, and only for Hugging Face
+/// hosts over HTTPS, so it never leaks to a server named in someone else's manifest.
+fn authorization(url: &str, token: Option<&str>) -> Option<String> {
+    let token = token.filter(|t| !t.is_empty())?;
+    is_hugging_face(url).then(|| format!("Bearer {token}"))
+}
+
 /// Streams `url` into `path` with a progress line on stderr; returns the byte count.
-///
-/// `HF_TOKEN` is sent as a bearer token, but only to Hugging Face hosts so it never leaks to a
-/// server named in someone else's manifest.
 fn download(url: &str, path: &Path) -> Result<u64> {
     let mut request = ureq::get(url);
-    if let Some(token) = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty())
-        && is_hugging_face(url)
-    {
-        request = request.header("Authorization", format!("Bearer {token}"));
+    if let Some(value) = authorization(url, std::env::var("HF_TOKEN").ok().as_deref()) {
+        request = request.header("Authorization", value);
     }
     let mut response = request.call().with_context(|| format!("GET {url}"))?;
     let total = response.body().content_length();
@@ -258,10 +326,16 @@ fn progress(done: u64, total: Option<u64>) -> String {
     }
 }
 
-/// True for `huggingface.co`, `hf.co` and their subdomains, over HTTPS.
+/// True for `huggingface.co`, `hf.co` and their subdomains, over HTTPS, as a URL parser reads the
+/// host (the part after any `user:password@`, which is refused outright).
 fn is_hugging_face(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else { return false };
-    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let Ok(uri) = url.parse::<Uri>() else { return false };
+    let Some(authority) = uri.authority() else { return false };
+    if !uri.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("https")) || authority.as_str().contains('@')
+    {
+        return false;
+    }
+    let host = authority.host().to_ascii_lowercase();
     ["huggingface.co", "hf.co"].iter().any(|h| host == *h || host.ends_with(&format!(".{h}")))
 }
 
@@ -292,9 +366,53 @@ mod tests {
     fn tokens_only_go_to_hugging_face() {
         assert!(is_hugging_face("https://huggingface.co/medarc/nanobrain/resolve/main/x.safetensors"));
         assert!(is_hugging_face("https://cdn-lfs.hf.co/x"));
+        assert!(is_hugging_face("HTTPS://HuggingFace.co/x"));
+        assert!(is_hugging_face("https://huggingface.co:443/x"));
         assert!(!is_hugging_face("http://huggingface.co/x"));
         assert!(!is_hugging_face("https://huggingface.co.evil.com/x"));
         assert!(!is_hugging_face("https://example.com/huggingface.co"));
+        // a host before '@' is user information; the request goes to the host after it
+        for url in [
+            "https://huggingface.co:443@evil.example/x",
+            "https://huggingface.co:x@evil.example/x",
+            "https://hf.co:1@evil.example/x",
+            "https://huggingface.co@evil.example/x",
+            "https://huggingface.co%40evil.example/x",
+            "HTTPS://evil.example/?x=huggingface.co",
+            "https://evil.example#huggingface.co",
+        ] {
+            assert!(!is_hugging_face(url), "{url}");
+            assert_eq!(authorization(url, Some("hf_secret")), None, "{url}");
+        }
+        assert_eq!(authorization("https://huggingface.co/x", Some("t")).as_deref(), Some("Bearer t"));
+        assert_eq!(authorization("https://huggingface.co/x", Some("")), None);
+        assert_eq!(authorization("https://huggingface.co/x", None), None);
+    }
+
+    #[test]
+    fn download_urls_must_be_https_without_user_information() {
+        assert_eq!(
+            download_url("https://example.org/w.safetensors", false).unwrap(),
+            "https://example.org/w.safetensors"
+        );
+        assert!(
+            download_url("http://example.org/w", false).unwrap_err().to_string().contains("--allow-http")
+        );
+        assert!(download_url("http://127.0.0.1:8765/w", true).is_ok());
+        assert!(download_url("ftp://example.org/w", true).is_err());
+        assert!(
+            download_url("https://huggingface.co:443@evil.example/x", false)
+                .unwrap_err()
+                .to_string()
+                .contains("user name")
+        );
+        assert!(download_url("not a url", false).is_err());
+        // hf.co redirects to huggingface.co, which would drop the token: go there directly
+        assert_eq!(
+            download_url("https://hf.co/org/repo/resolve/main/w.safetensors?download=1", false).unwrap(),
+            "https://huggingface.co/org/repo/resolve/main/w.safetensors?download=1"
+        );
+        assert_eq!(download_url("https://cdn-lfs.hf.co/x", false).unwrap(), "https://cdn-lfs.hf.co/x");
     }
 
     #[test]
