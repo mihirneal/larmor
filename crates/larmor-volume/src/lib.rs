@@ -30,6 +30,7 @@
 
 mod affine;
 mod filter;
+mod io;
 mod morphology;
 mod nifti;
 mod orientation;
@@ -38,9 +39,13 @@ mod stats;
 mod volume;
 
 pub use affine::Affine;
-pub use filter::{ExtendMode, Sigma, correlate1d_symmetric, gaussian_filter, gaussian_kernel1d};
+pub use filter::{
+    ExtendMode, KernelTooLarge, MAX_KERNEL_RADIUS, Sigma, correlate1d_symmetric, gaussian_filter,
+    gaussian_kernel1d,
+};
+pub use io::{write_atomic, write_atomic_with};
 pub use morphology::{binary_fill_holes, label, largest_component};
-pub use nifti::{DataType, Endian, Nifti, NiftiError, NiftiHeader, VoxelData};
+pub use nifti::{DataType, Endian, Nifti, NiftiError, NiftiHeader, NiftiVersion, VoxelData};
 pub use orientation::{AxisOrientation, Orientation, OrientationError, aff2axcodes, io_orientation};
 pub use resample::{Interpolation, Voxel, affine_transform, resample_from_to, vox2out_vox};
 pub use stats::{mean_f32, pairwise_sum_f32, pairwise_sum_f64, quantiles_linear, round_half_even};

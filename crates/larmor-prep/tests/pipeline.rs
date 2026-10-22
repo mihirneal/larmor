@@ -49,7 +49,7 @@ fn synthetic_scans_match_nanobrain_end_to_end() {
     let tensors = SafeTensors::deserialize(&bytes).unwrap();
     let cases: serde_json::Map<String, Value> =
         serde_json::from_str(&std::fs::read_to_string(dir.join("pipeline.json")).unwrap()).unwrap();
-    assert_eq!(cases.len(), 3);
+    assert_eq!(cases.len(), 4);
 
     for (name, params) in cases {
         let case = Case { name: name.clone(), params, tensors: &tensors };

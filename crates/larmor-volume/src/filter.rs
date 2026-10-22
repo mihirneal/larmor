@@ -2,6 +2,7 @@
 
 use ndarray::{Array3, Axis, Zip};
 use rayon::prelude::*;
+use thiserror::Error;
 
 use crate::stats::pairwise_sum_f64;
 
@@ -58,10 +59,43 @@ impl Sigma {
         }
     }
 
-    /// Kernel radius: `int(truncate * sigma + 0.5)`, as in `gaussian_filter1d`.
+    /// Kernel radius: `int(truncate * sigma + 0.5)`, as in `gaussian_filter1d` (saturating for
+    /// absurd sigmas; [`Sigma::checked_radius`] refuses those).
     pub fn radius(self, truncate: f64) -> usize {
         (truncate * self.value() + 0.5) as usize
     }
+
+    /// [`Sigma::radius`], or an error when the kernel would have more than
+    /// [`MAX_KERNEL_RADIUS`] taps on each side (or the radius is not finite).
+    ///
+    /// scipy fails there too, with `ValueError: Maximum allowed size exceeded` or a
+    /// `MemoryError` once the radius stops fitting in memory; a sigma that large comes from a
+    /// corrupt header (voxel sizes like 1e-30 mm), never from an MRI scan.
+    pub fn checked_radius(self, truncate: f64) -> Result<usize, KernelTooLarge> {
+        let radius = truncate * self.value() + 0.5;
+        if radius.is_finite() && radius < (MAX_KERNEL_RADIUS + 1) as f64 {
+            Ok(radius as usize)
+        } else {
+            Err(KernelTooLarge { sigma: self.value(), radius })
+        }
+    }
+}
+
+/// The largest Gaussian kernel radius (taps on each side of the centre) [`gaussian_filter`] builds:
+/// a sigma of 16384 voxels at scipy's `truncate=4`.
+pub const MAX_KERNEL_RADIUS: usize = 1 << 16;
+
+/// A Gaussian too wide to filter with (see [`Sigma::checked_radius`]).
+#[derive(Clone, Debug, Error, PartialEq)]
+#[error(
+    "a Gaussian of sigma {sigma:e} voxels needs a kernel radius of {radius:e} voxels, more than the \
+     {MAX_KERNEL_RADIUS} supported (are the header's voxel sizes right?)"
+)]
+pub struct KernelTooLarge {
+    /// The sigma, in voxels.
+    pub sigma: f64,
+    /// The radius it would need.
+    pub radius: f64,
 }
 
 /// The normalised 1-D Gaussian kernel of `2 * radius + 1` taps.
@@ -158,21 +192,28 @@ fn correlate_rows(data: &mut Array3<f32>, axis: usize, weights: &[f64], mode: Ex
 ///
 /// Mirrors `scipy.ndimage.gaussian_filter(input, sigma, mode=mode, truncate=truncate)` for a float32
 /// array: axes whose sigma is not above 1e-15 are skipped, and each pass is rounded to float32
-/// before the next one reads it.
+/// before the next one reads it. Fails, before filtering anything, when a kernel would be larger
+/// than [`MAX_KERNEL_RADIUS`].
 pub fn gaussian_filter(
     input: &Array3<f32>,
     sigmas: [Sigma; 3],
     mode: ExtendMode,
     truncate: f64,
-) -> Array3<f32> {
-    let mut output = input.as_standard_layout().into_owned();
-    for (axis, sigma) in sigmas.into_iter().enumerate() {
+) -> Result<Array3<f32>, KernelTooLarge> {
+    let mut radii = [0; 3];
+    for (radius, sigma) in radii.iter_mut().zip(sigmas) {
         if sigma.is_active() {
-            let weights = gaussian_kernel1d(sigma, sigma.radius(truncate));
+            *radius = sigma.checked_radius(truncate)?;
+        }
+    }
+    let mut output = input.as_standard_layout().into_owned();
+    for (axis, (sigma, radius)) in sigmas.into_iter().zip(radii).enumerate() {
+        if sigma.is_active() {
+            let weights = gaussian_kernel1d(sigma, radius);
             correlate1d_symmetric(&mut output, axis, &weights, mode);
         }
     }
-    output
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -193,5 +234,22 @@ mod tests {
         assert_eq!(k.len(), 17);
         assert!((k.iter().sum::<f64>() - 1.0).abs() < 1e-15);
         assert!(k.iter().zip(k.iter().rev()).all(|(a, b)| a == b));
+    }
+
+    #[test]
+    fn absurd_sigmas_are_refused_instead_of_building_an_empty_kernel() {
+        // a header voxel size of 1e-30 mm makes the mask's 4 mm sigma 4e30 voxels
+        let x = Array3::<f32>::ones([3, 3, 3]);
+        let tiny_voxels = [Sigma::F32(4e30), Sigma::F32(2.0), Sigma::F32(2.0)];
+        let err = gaussian_filter(&x, tiny_voxels, ExtendMode::Reflect, 4.0).unwrap_err();
+        assert!(err.to_string().contains("kernel radius"), "{err}");
+        assert!(Sigma::F64(f64::INFINITY).checked_radius(4.0).is_err());
+        assert_eq!(Sigma::F32(2.0).checked_radius(4.0), Ok(8));
+        let largest = MAX_KERNEL_RADIUS as f64 / 4.0;
+        assert_eq!(Sigma::F64(largest).checked_radius(4.0), Ok(MAX_KERNEL_RADIUS));
+        assert!(Sigma::F64(largest + 0.25).checked_radius(4.0).is_err());
+        // inactive axes are not checked, as scipy skips them
+        let skipped = [Sigma::F64(0.0), Sigma::F64(f64::NAN), Sigma::F64(1.0)];
+        assert!(gaussian_filter(&x, skipped, ExtendMode::Nearest, 4.0).is_ok());
     }
 }

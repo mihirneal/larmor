@@ -11,6 +11,7 @@ thiserror.workspace = true
 rayon.workspace = true
 ndarray = { version = "0.17.2", features = ["rayon"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+tempfile = "3.27.0"
 
 [dev-dependencies]
 serde_json.workspace = true

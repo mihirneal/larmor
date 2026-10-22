@@ -6,9 +6,9 @@ mod common;
 use common::{Reference, assert_bits_eq_f32, assert_bits_eq_f64};
 use larmor_volume::ndarray::{Array3, ArrayD, Ix3};
 use larmor_volume::{
-    Affine, ExtendMode, Interpolation, Nifti, Sigma, Volume, Voxel, VoxelData, affine_transform,
-    binary_fill_holes, gaussian_filter, gaussian_kernel1d, io_orientation, label, largest_component,
-    mean_f32, pairwise_sum_f32, pairwise_sum_f64, quantiles_linear, vox2out_vox,
+    Affine, ExtendMode, Interpolation, Nifti, NiftiVersion, Sigma, Volume, Voxel, VoxelData,
+    affine_transform, binary_fill_holes, gaussian_filter, gaussian_kernel1d, io_orientation, label,
+    largest_component, mean_f32, pairwise_sum_f32, pairwise_sum_f64, quantiles_linear, vox2out_vox,
 };
 use safetensors::Dtype;
 
@@ -76,7 +76,7 @@ fn gaussian_filter_matches_scipy() {
             "nearest" => ExtendMode::Nearest,
             other => panic!("mode {other}"),
         };
-        let got = gaussian_filter(&x, sigmas, mode, 4.0);
+        let got = gaussian_filter(&x, sigmas, mode, 4.0).unwrap();
         let expected = r.f32_array(&format!("{name}/expected"));
         assert_eq!(got.shape(), expected.shape());
         assert_bits_eq_f32(got.iter().copied(), expected.iter().copied(), &name);
@@ -223,7 +223,9 @@ fn voxels_as_f64(data: &VoxelData) -> Vec<f64> {
 #[test]
 fn nifti_headers_and_data_match_nibabel() {
     let r = Reference::load("nifti");
-    for (name, case) in r.cases_of("nifti") {
+    let cases = r.cases_of("nifti").into_iter().chain(r.cases_of("nifti2"));
+    for (name, case) in cases {
+        let nifti2 = case["kind"] == "nifti2";
         for source in ["bytes", "gz"] {
             let what = format!("{name} ({source})");
             let img = Nifti::from_bytes(&r.u8s(&format!("{name}/{source}")))
@@ -233,7 +235,13 @@ fn nifti_headers_and_data_match_nibabel() {
             assert_eq!(img.shape(), shape.as_slice(), "{what} shape");
             assert_eq!(img.data.dtype().name(), case["dtype"].as_str().unwrap(), "{what} dtype");
             assert_eq!(img.affine().unwrap(), r.affine(&format!("{name}/affine")), "{what} affine");
-            assert_eq!(img.zooms(), r.f32s(&format!("{name}/zooms")), "{what} zooms");
+            if nifti2 {
+                assert_eq!(img.header.version, NiftiVersion::Two, "{what}");
+                assert_eq!(img.header.zooms_f64(), r.f64s(&format!("{name}/zooms")), "{what} zooms");
+            } else {
+                assert_eq!(img.header.version, NiftiVersion::One, "{what}");
+                assert_eq!(img.zooms(), r.f32s(&format!("{name}/zooms")), "{what} zooms");
+            }
 
             let fdata = img.fdata_f32();
             assert_bits_eq_f32(
@@ -263,6 +271,13 @@ fn nifti_headers_and_data_match_nibabel() {
                 other => panic!("{what}: dtype {other:?}"),
             };
             assert_bits_eq_f64(voxels_as_f64(&dataobj), expected, &what);
+
+            // written back in its own version, the image reads the same
+            let back = Nifti::from_bytes(&img.to_bytes()).unwrap_or_else(|e| panic!("{what} rewritten: {e}"));
+            assert_eq!(back.header.version, img.header.version, "{what} rewritten");
+            assert_eq!(back.affine().unwrap(), img.affine().unwrap(), "{what} rewritten affine");
+            assert_eq!(back.header.zooms_f64(), img.header.zooms_f64(), "{what} rewritten zooms");
+            assert_eq!(back.data, img.data, "{what} rewritten data");
         }
     }
 }

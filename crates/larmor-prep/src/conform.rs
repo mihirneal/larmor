@@ -45,7 +45,7 @@ pub fn conform_image(nifti: &Nifti, mask: &Volume<u8>, config: &Conform) -> Resu
     let voxel_sizes = canonical.zooms;
     let canonical_shape = canonical.shape();
 
-    let (canonical, fwhm) = anti_alias(canonical, config.min_voxel_size);
+    let (canonical, fwhm) = anti_alias(canonical, config.min_voxel_size)?;
     let centroid = grid_centroid(ornt.apply(mask.data.view()), voxel_sizes, canonical_shape[2], config)?;
 
     let new_shape = config.fov.map(|w| (w / config.min_voxel_size).ceil() as usize);
@@ -75,10 +75,10 @@ fn canonical_f32(nifti: &Nifti, scan: &Scan, ornt: &Orientation) -> Result<Volum
 /// Mirrors the `smooth before downsampling` block of `conform_image` and
 /// `nibabel.processing.smooth_image(img, fwhm, mode="nearest")`. The FWHM arithmetic follows
 /// numpy's promotion: `sz_**2 - sz**2` is a Python float minus a float32, so it is float32.
-fn anti_alias(image: Volume<f32>, min_voxel_size: f64) -> (Volume<f32>, [f64; 3]) {
+fn anti_alias(image: Volume<f32>, min_voxel_size: f64) -> Result<(Volume<f32>, [f64; 3]), PrepError> {
     let target = min_voxel_size as f32;
     if !image.zooms.iter().any(|&size| target > size) {
-        return (image, [0.0; 3]);
+        return Ok((image, [0.0; 3]));
     }
     let target_sq = (min_voxel_size * min_voxel_size) as f32;
     let fwhm = image.zooms.map(|size| {
@@ -89,8 +89,8 @@ fn anti_alias(image: Volume<f32>, min_voxel_size: f64) -> (Volume<f32>, [f64; 3]
     });
     let vox = image.affine.voxel_sizes();
     let sigmas = std::array::from_fn(|axis| Sigma::F64(fwhm[axis] / vox[axis] / SIGMA2FWHM));
-    let data = gaussian_filter(&image.data, sigmas, ExtendMode::Nearest, 4.0);
-    (Volume { data, ..image }, fwhm)
+    let data = gaussian_filter(&image.data, sigmas, ExtendMode::Nearest, 4.0)?;
+    Ok((Volume { data, ..image }, fwhm))
 }
 
 /// The RAS+ voxel the output grid is centred on.

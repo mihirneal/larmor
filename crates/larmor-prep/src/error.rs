@@ -1,6 +1,6 @@
 //! Errors from preprocessing.
 
-use larmor_volume::{NiftiError, OrientationError};
+use larmor_volume::{KernelTooLarge, NiftiError, OrientationError};
 use thiserror::Error;
 
 use crate::recipe::RecipeError;
@@ -18,8 +18,22 @@ pub enum PrepError {
     #[error(transparent)]
     Orientation(#[from] OrientationError),
     /// The recipe needs a 3-D image.
-    #[error("expected a 3-D image, got shape {0:?}")]
+    #[error(
+        "expected a 3-D image, got shape {0:?} (a 4-D series such as fMRI or DWI is not an anatomical \
+         scan; pass a 3-D volume)"
+    )]
     NotThreeD(Vec<usize>),
+    /// A Gaussian smoothing kernel would be absurdly large (corrupt voxel sizes in the header).
+    #[error(transparent)]
+    Kernel(#[from] KernelTooLarge),
+    /// The head mask's resampling grid would be absurdly large (corrupt geometry in the header).
+    #[error(
+        "the head mask grid would be {shape:?} voxels; the header's geometry (voxel sizes or affine) looks corrupt"
+    )]
+    GridTooLarge {
+        /// The grid shape, saturated where it overflows.
+        shape: [usize; 3],
+    },
     /// An affine could not be inverted.
     #[error("the scan's affine is singular")]
     SingularAffine,

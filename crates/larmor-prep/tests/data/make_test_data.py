@@ -72,8 +72,18 @@ def nifti_bytes(data, affine, dtype, slope=None, inter=None) -> bytes:
     return img.to_bytes()
 
 
+def nifti2_bytes(data, affine, dtype, zooms) -> bytes:
+    """A NIfTI-2 with an sform (code 1) and float64 header zooms that differ from the affine's."""
+    img = nib.Nifti2Image(data.astype(dtype), affine)
+    img.header.set_sform(affine, code=1)
+    img.header.set_qform(affine, code=0)
+    img.header["pixdim"][1:4] = zooms
+    return img.to_bytes()
+
+
 def run_case(name, t, cases, raw: bytes):
-    img = nib.Nifti1Image.from_bytes(raw)
+    nifti2 = int.from_bytes(raw[:4], "little") == 540
+    img = (nib.Nifti2Image if nifti2 else nib.Nifti1Image).from_bytes(raw)
     captured = {}
     rescale = preproc.rescale_affine
 
@@ -153,6 +163,13 @@ def main():
     shape = (36, 44, 36)
     data = phantom(shape, affine)
     run_case("ras_fine_uint8", t, cases, nifti_bytes(np.clip(data / 6, 0, 255), affine, np.uint8))
+
+    # NIfTI-2, 2 mm RAS: the 2 mm mask grid is the scan's own, so threshold_mask smooths with the
+    # header's float64 zooms, which resample_to_output (a Nifti1Image) rounds to float32
+    affine = nib.affines.from_matvec(np.diag([2.0, 2.0, 2.0]), [-14.0, -18.0, -14.0])
+    shape = (15, 19, 15)
+    run_case("nifti2_ras_2mm", t, cases,
+             nifti2_bytes(phantom(shape, affine), affine, np.float32, (1.9999999, 2.0000003, 1.99999)))
 
     tensors = {k: np.ascontiguousarray(v) for k, v in t.items()}
     save_file(tensors, OUT / "pipeline.safetensors")

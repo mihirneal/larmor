@@ -1,4 +1,59 @@
 {
+ "n2_base_affine": {
+  "dataobj_dtype": "uint8",
+  "dtype": "uint8",
+  "kind": "nifti2",
+  "notes": "no codes: centred base affine from float64 zooms",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n2_big_endian_scaled": {
+  "dataobj_dtype": "float64",
+  "dtype": "int16",
+  "kind": "nifti2",
+  "notes": "big-endian, float64 slope",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n2_qform_qfac_neg": {
+  "dataobj_dtype": "float32",
+  "dtype": "float32",
+  "kind": "nifti2",
+  "notes": "qform only in float64, qfac -1",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n2_quat_w_threshold": {
+  "dataobj_dtype": "int16",
+  "dtype": "int16",
+  "kind": "nifti2",
+  "notes": "1 - |bcd|^2 within float64's threshold (float32's is wider)",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
+ "n2_sform": {
+  "dataobj_dtype": "int16",
+  "dtype": "int16",
+  "kind": "nifti2",
+  "notes": "float64 sform and pixdim",
+  "shape": [
+   4,
+   5,
+   3
+  ]
+ },
  "n_base_affine": {
   "dataobj_dtype": "uint8",
   "dtype": "uint8",

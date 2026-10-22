@@ -11,7 +11,8 @@ pub(crate) struct Scan {
     pub(crate) shape: [usize; 3],
     /// Voxel-to-world affine (`img.affine`).
     pub(crate) affine: Affine,
-    /// Header voxel sizes (`img.header.get_zooms()`).
+    /// Header voxel sizes (`img.header.get_zooms()`) as float32: a NIfTI-2 header's float64 zooms
+    /// rounded, as nibabel's resampling (which returns a `Nifti1Image`) rounds them.
     pub(crate) zooms: [f32; 3],
 }
 

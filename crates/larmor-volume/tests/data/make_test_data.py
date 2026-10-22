@@ -362,6 +362,56 @@ def make_nifti():
               sform=affine_from(np.eye(3), [0, 0, 0]), sform_code=1)
     build("four_d", rng.integers(0, 100, (3, 4, 5, 2)).astype(np.int16), sform=affine_from(np.eye(3), [0, 0, 0]),
           sform_code=1, pixdim=(1.0, 1.0, 1.0, 2.5), notes="4-D image")
+
+    # NIfTI-2: 540-byte header, int64 dims, float64 pixdim, quaternion, offsets and sform
+    def build2(name, data, *, endian="<", sform=None, sform_code=0, qform_code=0, pixdim=None, quatern=None,
+               qoffset=(0.0, 0.0, 0.0), qfac=1.0, slope=1.0, inter=0.0, notes=""):
+        hdr = nib.Nifti2Header(endianness=endian)
+        hdr.set_data_shape(data.shape)
+        hdr.set_data_dtype(data.dtype)
+        if sform is not None:
+            hdr.set_sform(sform, code=sform_code)
+        hdr["sform_code"] = sform_code
+        hdr["qform_code"] = qform_code
+        if quatern is not None:
+            hdr["quatern_b"], hdr["quatern_c"], hdr["quatern_d"] = quatern
+            hdr["qoffset_x"], hdr["qoffset_y"], hdr["qoffset_z"] = qoffset
+        if pixdim is not None:
+            hdr["pixdim"][1 : 1 + len(pixdim)] = pixdim
+        hdr["pixdim"][0] = qfac
+        hdr["scl_slope"] = slope
+        hdr["scl_inter"] = inter
+        hdr["vox_offset"] = 544
+        raw = hdr.binaryblock + b"\0" * 4 + data.astype(data.dtype.newbyteorder(endian)).tobytes(order="F")
+        img = nib.Nifti2Image.from_bytes(raw)
+        t[f"n2_{name}/bytes"] = np.frombuffer(raw, dtype=np.uint8)
+        t[f"n2_{name}/gz"] = np.frombuffer(gzip.compress(raw, mtime=0), dtype=np.uint8)
+        t[f"n2_{name}/affine"] = img.affine
+        t[f"n2_{name}/zooms"] = np.array(img.header.get_zooms(), dtype=np.float64)
+        t[f"n2_{name}/fdata"] = img.get_fdata(dtype=np.float32)
+        dataobj = np.asanyarray(img.dataobj)
+        t[f"n2_{name}/dataobj"] = dataobj
+        cases[f"n2_{name}"] = {
+            "kind": "nifti2",
+            "shape": list(img.shape),
+            "dtype": img.get_data_dtype().name,
+            "dataobj_dtype": dataobj.dtype.name,
+            "notes": notes,
+        }
+
+    # float64 values that float32 cannot hold, so a NIfTI-1 reading would round them
+    fine = affine_from(oblique * np.array([0.9000000001, 1.1000000003, 1.3]), [-91.123456789012, 2.5, 3.0000001])
+    build2("sform", i16, sform=fine, sform_code=1, pixdim=(0.9000000001, 1.1000000003, 1.3),
+           notes="float64 sform and pixdim")
+    build2("qform_qfac_neg", rng.standard_normal(shape).astype(np.float32), qform_code=2,
+           quatern=(0.1000000001, -0.2, 0.3), qoffset=(10.5000000001, -20.25, 30.0), pixdim=(0.9, 1.1, 1.3),
+           qfac=-1.0, notes="qform only in float64, qfac -1")
+    build2("quat_w_threshold", i16, qform_code=1, quatern=(0.6, 0.8, 1e-9), pixdim=(1.0, 1.0, 1.0),
+           notes="1 - |bcd|^2 within float64's threshold (float32's is wider)")
+    build2("base_affine", rng.integers(0, 255, shape).astype(np.uint8), pixdim=(1.2000000001, 0.9, 3.0),
+           notes="no codes: centred base affine from float64 zooms")
+    build2("big_endian_scaled", rng.integers(-1000, 1000, shape).astype(np.int16), endian=">", sform=fine,
+           sform_code=4, slope=2.5000000001, inter=-3.0, notes="big-endian, float64 slope")
     save("nifti", t, cases)
 
 
