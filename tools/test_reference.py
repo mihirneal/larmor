@@ -19,8 +19,10 @@ from larmor_ref import FIXTURES, sha256_file
 
 GRID = (192, 240, 192)
 REFERENCE = FIXTURES / "reference"
-SCANS = tomllib.loads((FIXTURES / "manifest.toml").read_text())["scan"]
-ENCODES = [(scan, model_id) for scan in SCANS for model_id in scan["encode"]]
+MANIFEST = tomllib.loads((FIXTURES / "manifest.toml").read_text())
+SCANS = MANIFEST["scan"]
+PAIRS = MANIFEST.get("pair", [])
+ENCODES = [(scan, model_id) for scan in SCANS + PAIRS for model_id in scan["encode"]]
 
 
 def scan_id(scan):
@@ -99,6 +101,25 @@ def test_prep_reference(scan):
     assert q.dtype == np.uint16
     assert not q[mask == 0].any(), "quantized is nonzero outside the fit mask"
     assert q[mask > 0].max() == 65535 and info["vmax"] > info["vmin"]
+
+
+@pytest.mark.parametrize("pair", PAIRS, ids=scan_id)
+def test_pair_reference(pair):
+    scans = {scan["name"]: scan for scan in SCANS}
+    target, reference = scans[pair["target"]], scans[pair["reference"]]
+    prep_dir = REFERENCE / "prep" / pair["name"]
+    info = json.loads((prep_dir / "info.json").read_text())
+    assert info["scan_sha256"] == target["sha256"] and info["reference_sha256"] == reference["sha256"]
+    # the head mask is the reference's own
+    reference_mask = REFERENCE / "prep" / reference["name"] / "head_mask.nii.gz"
+    assert np.array_equal(
+        np.asanyarray(nib.load(prep_dir / "head_mask.nii.gz").dataobj), np.asanyarray(nib.load(reference_mask).dataobj)
+    )
+    assert np.allclose(info["image_affine"], info["fit_affine"], atol=1e-3)
+    mask = np.asanyarray(nib.load(prep_dir / "fit_mask.nii.gz").dataobj)
+    assert int(mask.sum()) == info["fit_mask_voxels"] > 0
+    q = np.asanyarray(nib.load(prep_dir / "quantized.nii.gz").dataobj)
+    assert q.dtype == np.uint16 and not q[mask == 0].any() and q[mask > 0].max() == 65535
 
 
 @pytest.mark.parametrize("item", ENCODES, ids=encode_id)

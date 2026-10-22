@@ -44,6 +44,18 @@ pub struct ParityOptions {
 #[derive(Deserialize)]
 struct FixtureManifest {
     scan: Vec<FixtureScan>,
+    /// Target scans prepared on a reference scan's head mask and grid.
+    #[serde(default)]
+    pair: Vec<FixturePair>,
+}
+
+/// A `[[pair]]`: `target` prepared on `reference`'s head mask and grid, as `prepare_images` does
+/// with `reference=` (both are `[[scan]]` names).
+#[derive(Deserialize)]
+struct FixturePair {
+    name: String,
+    target: String,
+    reference: String,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +102,8 @@ struct EncodeReport {
 #[derive(Default)]
 struct ScanReport {
     name: String,
+    /// A pair: a target on a reference scan's mask, gated bit-exact.
+    pair: bool,
     prep: Option<PrepReport>,
     encodes: Vec<EncodeReport>,
     failures: Vec<String>,
@@ -144,11 +158,115 @@ pub fn cmd_check_parity(options: ParityOptions) -> Result<()> {
         print_rows(&report);
         reports.push(report);
     }
+    for pair in &manifest.pair {
+        let report = check_pair(root, pair, &manifest.scan, &prep_recipe, &models);
+        print_rows(&report);
+        reports.push(report);
+    }
     let failed = print_summary(&reports, &models, start.elapsed().as_secs_f64());
     if failed > 0 {
-        bail!("{failed} of {} scans failed a parity gate", reports.len());
+        let what = if manifest.pair.is_empty() { "scans" } else { "scans and pairs" };
+        bail!("{failed} of {} {what} failed a parity gate", reports.len());
     }
     Ok(())
+}
+
+fn check_pair(
+    root: &Path,
+    pair: &FixturePair,
+    scans: &[FixtureScan],
+    prep_recipe: &Recipe,
+    models: &BTreeMap<String, ReferenceModel>,
+) -> ScanReport {
+    let start = Instant::now();
+    let mut report = ScanReport { name: pair.name.clone(), pair: true, ..ScanReport::default() };
+    if let Err(err) = check_pair_inner(root, pair, scans, prep_recipe, models, &mut report) {
+        report.failures.push(format!("{err:#}"));
+    }
+    report.seconds = start.elapsed().as_secs_f64();
+    report
+}
+
+/// A pair's preprocessing must equal `prepare_images` with `reference=` bit for bit: fit mask,
+/// quantized volume, grid and image affines, and (through the encode references) the token grid.
+fn check_pair_inner(
+    root: &Path,
+    pair: &FixturePair,
+    scans: &[FixtureScan],
+    prep_recipe: &Recipe,
+    models: &BTreeMap<String, ReferenceModel>,
+    report: &mut ScanReport,
+) -> Result<()> {
+    let read = |name: &str, report: &mut ScanReport| -> Result<(Nifti, String)> {
+        let scan =
+            scans.iter().find(|s| s.name == name).with_context(|| format!("no [[scan]] named {name}"))?;
+        let path = root.join(&scan.file);
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let sha = sha256_hex(&bytes);
+        report.gate(sha == scan.sha256, || format!("{name}: sha256 {sha} vs manifest {}", scan.sha256));
+        Ok((Nifti::from_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))?, sha))
+    };
+    let (target, target_sha) = read(&pair.target, report)?;
+    let (reference, reference_sha) = read(&pair.reference, report)?;
+    let dir = root.join("reference/prep").join(&pair.name);
+    let (prepared, references) =
+        rayon::join(|| prep_recipe.run_with_reference(&target, &reference), || PrepReferences::read(&dir));
+    let prepared = prepared.context("preprocessing on the reference's mask")?;
+    let references = references?;
+    let info = &references.info;
+    report.gate(
+        info["scan_sha256"].as_str() == Some(target_sha.as_str())
+            && info["reference_sha256"].as_str() == Some(reference_sha.as_str()),
+        || "prep reference was made from other files".into(),
+    );
+    let prep = compare_prep(&references, &prepared, report);
+    report.gate(prep.fit_disagree == 0, || {
+        format!("fit mask: {} voxels disagree (must be 0)", prep.fit_disagree)
+    });
+    report.gate(prep.quant_exact == 1.0, || "quantized volume is not bit-exact".into());
+    let image_affine: Option<[[f64; 4]; 4]> = serde_json::from_value(info["image_affine"].clone()).ok();
+    report.gate(image_affine == Some(prepared.image_affine.0), || {
+        format!("image affine {:?} vs {image_affine:?}", prepared.image_affine.0)
+    });
+    report.prep = Some(prep);
+    for (id, reference_model) in models {
+        let reference_path =
+            root.join("reference/encode").join(id).join(format!("{}.safetensors", pair.name));
+        if !reference_path.is_file() {
+            continue;
+        }
+        let encode = compare_encode(
+            reference_model,
+            &reference_path,
+            &target,
+            Some(&reference),
+            &prepared,
+            prep_recipe,
+        )
+        .with_context(|| id.clone())?;
+        gate_encode(report, id, &encode);
+        report.encodes.push(encode);
+    }
+    Ok(())
+}
+
+/// The token-grid and cosine gates of one encode comparison.
+fn gate_encode(report: &mut ScanReport, id: &str, encode: &EncodeReport) {
+    report.gate(encode.coords_equal, || {
+        format!(
+            "{id}: {} tokens vs reference {} (or different coords)",
+            encode.tokens, encode.reference_tokens
+        )
+    });
+    // tokens on different grids cannot be compared one to one
+    if encode.coords_equal {
+        report.gate(encode.min_cosine >= MIN_COSINE, || {
+            format!("{id}: min token cosine {:.6}", encode.min_cosine)
+        });
+        report.gate(encode.pooled_cosine >= MIN_COSINE, || {
+            format!("{id}: pooled cosine {:.6}", encode.pooled_cosine)
+        });
+    }
 }
 
 /// Every model with a folder in `reference/encode/`, or the ones `--models` names, with its encoder.
@@ -227,23 +345,9 @@ fn check_scan_inner(
         if !reference_path.is_file() {
             continue;
         }
-        let encode = compare_encode(reference_model, &reference_path, &nifti, &prepared, prep_recipe)
+        let encode = compare_encode(reference_model, &reference_path, &nifti, None, &prepared, prep_recipe)
             .with_context(|| id.clone())?;
-        report.gate(encode.coords_equal, || {
-            format!(
-                "{id}: {} tokens vs reference {} (or different coords)",
-                encode.tokens, encode.reference_tokens
-            )
-        });
-        // tokens on different grids cannot be compared one to one
-        if encode.coords_equal {
-            report.gate(encode.min_cosine >= MIN_COSINE, || {
-                format!("{id}: min token cosine {:.6}", encode.min_cosine)
-            });
-            report.gate(encode.pooled_cosine >= MIN_COSINE, || {
-                format!("{id}: pooled cosine {:.6}", encode.pooled_cosine)
-            });
-        }
+        gate_encode(report, id, &encode);
         report.encodes.push(encode);
     }
     Ok(())
@@ -411,6 +515,7 @@ fn compare_encode(
     reference_model: &ReferenceModel,
     path: &Path,
     nifti: &Nifti,
+    reference_nifti: Option<&Nifti>,
     prepared: &Prepared,
     prep_recipe: &Recipe,
 ) -> Result<EncodeReport> {
@@ -419,7 +524,10 @@ fn compare_encode(
     let prepared = if model.recipe == *prep_recipe {
         prepared
     } else {
-        own_prepared = model.recipe.run(nifti)?;
+        own_prepared = match reference_nifti {
+            None => model.recipe.run(nifti)?,
+            Some(reference) => model.recipe.run_with_reference(nifti, reference)?,
+        };
         &own_prepared
     };
     let tokens = prepared.tokens(model.patch())?;
@@ -598,6 +706,18 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
         "all",
         not_exact.is_empty(),
     );
+    let pairs: Vec<&ScanReport> = reports.iter().filter(|r| r.pair).collect();
+    if !pairs.is_empty() {
+        let inexact: Vec<&str> =
+            pairs.iter().filter(|r| !r.failures.is_empty()).map(|r| r.name.as_str()).collect();
+        row(
+            "pairs on a reference mask bit-exact",
+            format!("{}/{} pairs", pairs.len() - inexact.len(), pairs.len()),
+            inexact.first().copied().unwrap_or("-"),
+            "all",
+            inexact.is_empty(),
+        );
+    }
     for id in models.keys() {
         let encodes: Vec<(&str, &EncodeReport)> = reports
             .iter()
@@ -666,15 +786,22 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
     }
     let failed = reports.iter().filter(|r| !r.failures.is_empty()).count();
     let encodes: usize = reports.iter().map(|r| r.encodes.len()).sum();
+    let n_pairs = reports.iter().filter(|r| r.pair).count();
+    let pairs_text = match n_pairs {
+        0 => String::new(),
+        1 => "1 pair, ".to_string(),
+        n => format!("{n} pairs, "),
+    };
     if failed == 0 {
         println!(
-            "{} {} scans, {encodes} encodes: every gate passes ({})",
+            "{} {} scans, {pairs_text}{encodes} encodes: every gate passes ({})",
             green("✓"),
-            reports.len(),
+            reports.len() - n_pairs,
             secs(seconds)
         );
     } else {
-        println!("{} {failed} of {} scans failed ({})", red("✗"), reports.len(), secs(seconds));
+        let what = if n_pairs == 0 { "scans" } else { "scans and pairs" };
+        println!("{} {failed} of {} {what} failed ({})", red("✗"), reports.len(), secs(seconds));
         for r in reports.iter().filter(|r| !r.failures.is_empty()) {
             println!("  {}: {}", r.name, r.failures.join("; "));
         }

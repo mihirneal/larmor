@@ -4,13 +4,17 @@
     python fetch_fixtures.py --force    # also rebuild synthetic variants that already exist
     python fetch_fixtures.py --check    # only verify the files listed in the manifest
 
-Three kinds of scan, all 3D NIfTI-1 .nii.gz:
+Three kinds of scan, all 3D NIfTI-1 .nii.gz (plus `[[pair]]` entries, below):
 
 * openneuro: real public scans over anonymous HTTPS, byte-identical to the source and pinned by sha256.
   The DWI b0 is the one derived file: volume 0 cut out of a pinned 4D series kept in fixtures/downloads/.
 * templateflow: MNI templates fetched by the templateflow client (TEMPLATEFLOW_HOME=fixtures/templateflow).
 * synthetic: deterministic nibabel variants of mni152-t1w (and one of ds001246-t1w), chosen so that every
   branch of nanobrain's threshold_mask and conform_image runs on at least one fixture.
+
+A `[[pair]]` names two scans of one subject on the same voxel grid, a target prepared on its reference's head
+mask and grid as `eval/prepare.py::prepare_images(images, segs, reference=...)` prepares FOMO tasks 1 and 2 (ADC and
+DWI on the FLAIR's mask); make_reference.py writes their references under reference/prep/<pair name>/.
 
 Synthetic files are written field by field (so a header is exactly what the fixture tests, including stale
 qform/sform matrices whose code is 0) with a fixed gzip header, so a rebuild with the same zlib gives the
@@ -513,6 +517,35 @@ FIXTURE_SET: list[Fixture] = [
 # manifest
 
 
+@dataclass(frozen=True)
+class Pair:
+    name: str
+    target: str  # a FIXTURE_SET name
+    reference: str  # a FIXTURE_SET name on the same voxel grid
+    notes: str
+
+
+PAIRS: list[Pair] = [
+    Pair(
+        "mni152-2009c-t2w-ref-t1w",
+        "mni152-2009c-t2w",
+        "mni152-2009c-t1w",
+        "T2w prepared on the T1w's head mask and grid (prepare_images with reference), the multi-modal path",
+    ),
+]
+
+
+def pair_entry(pair: Pair) -> list[str]:
+    fields = {
+        "name": pair.name,
+        "target": pair.target,
+        "reference": pair.reference,
+        "encode": [m for m in MODELS if m.endswith("p8-ref")],
+        "notes": pair.notes,
+    }
+    return ["[[pair]]", *(f"{k} = {toml_value(v)}" for k, v in fields.items()), ""]
+
+
 def raw_header(path: Path) -> nib.Nifti1Header:
     """The header fields exactly as stored (a loaded image's header has scl_slope/scl_inter reset)."""
     with gzip.open(path, "rb") as f:
@@ -557,12 +590,17 @@ def write_manifest(fixtures: list[Fixture]) -> None:
         "# Larmor fixture scans: written by tools/fetch_fixtures.py, do not edit by hand.",
         "# file is relative to this directory. zooms are the affine's column norms (what nibabel resamples",
         "# with); scl_slope = nan or 0 means unscaled. encode lists the models with an encode reference.",
+        "# A [[pair]] is a target scan prepared on a reference scan's head mask and grid (prepare_images).",
         "",
     ]
     for fixture in fixtures:
         lines += manifest_entry(fixture)
+    names = {f.name for f in fixtures}
+    for pair in PAIRS:
+        assert {pair.target, pair.reference} <= names, pair
+        lines += pair_entry(pair)
     MANIFEST.write_text("\n".join(lines))
-    print(f"wrote {MANIFEST} ({len(fixtures)} scans)")
+    print(f"wrote {MANIFEST} ({len(fixtures)} scans, {len(PAIRS)} pairs)")
 
 
 def check_manifest() -> None:

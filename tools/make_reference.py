@@ -1,11 +1,17 @@
 """PyTorch/nibabel reference outputs that Larmor is checked against.
 
     python make_reference.py prep SCAN --name NAME          # preprocessing stages -> reference/prep/NAME/
+    python make_reference.py prep SCAN --name NAME --reference REF   # SCAN on REF's head mask and grid
     python make_reference.py encode NAME --model MODEL.toml  # encoder outputs -> reference/encode/ID/NAME.safetensors
-    python make_reference.py all [--force] [NAME ...]        # prep and encode for every scan in fixtures/manifest.toml
+    python make_reference.py all [--force] [NAME ...]        # prep and encode for every scan and pair in fixtures/manifest.toml
 
 Layouts are specified in docs/DESIGN.md ("Reference fixtures"). Every stage is produced by nanobrain's own
 functions; `prep` also checks that the captured stages equal `prepare_images` byte for byte.
+
+A pair (`[[pair]]` in the manifest, `prep --reference`) is the multi-modal path of `prepare_images`: the head mask
+comes from the reference scan, the target is conformed with it, and quantized inside the reference's fit mask. Its
+`head_mask.nii.gz` is the reference's; `info.json` adds `reference`, `reference_sha256` and `image_affine` (the
+target's own conformed affine; `fit_affine` is the reference's grid, which the mask and labels live on).
 
 `all` encodes each scan with the models its manifest entry lists under `encode` (patch 8 for every scan,
 patch 4 for a few) and skips outputs that are already current: a prep whose info.json records the scan's
@@ -207,6 +213,77 @@ def run_prep(scan: Path, name: str, out_root: Path = REFERENCE / "prep") -> dict
     return info
 
 
+def run_prep_pair(scan: Path, reference: Path, name: str, out_root: Path = REFERENCE / "prep") -> dict:
+    """prepare_images({"ref": reference, "other": scan}, {}, reference="ref"), keeping the target's stages."""
+    img = nib.load(scan)
+    ref_img = nib.load(reference)
+    captured = {}
+    rescale_affine = preproc.rescale_affine
+
+    def capture_rescale(affine, shape, zooms, new_shape=None, centroid=None):
+        captured.setdefault("centroids", []).append(np.asarray(centroid).tolist())
+        return rescale_affine(affine, shape, zooms, new_shape=new_shape, centroid=centroid)
+
+    t0 = time.perf_counter()
+    mask_img = preproc.threshold_mask(ref_img)
+    t1 = time.perf_counter()
+    preproc.rescale_affine = capture_rescale
+    try:
+        reference_conform = preproc.conform_image(ref_img, mask_img, max_fov=prepare.GRID_FOV, fixed_grid=True)
+        conform_img = preproc.conform_image(img, mask_img, max_fov=prepare.GRID_FOV, fixed_grid=True)
+    finally:
+        preproc.rescale_affine = rescale_affine
+    t2 = time.perf_counter()
+    affine = reference_conform.affine
+    assert np.allclose(conform_img.affine, affine, atol=1e-3), "grid mismatch"
+    fit_mask = np.asarray(resample_from_to(mask_img, reference_conform, order=0).dataobj) > 0
+    fit_mask_img = nib.Nifti1Image(fit_mask.astype(np.uint8), affine)
+    quant_img = prepare.truncate_image(conform_img, fit_mask_img, (prepare.VMIN_QUANTILE, prepare.VMAX_QUANTILE))
+    t3 = time.perf_counter()
+
+    # the stages above must be exactly what the eval framework stores for the target modality
+    encoded = prepare.prepare_images({"ref": ref_img, "other": img}, {}, reference="ref")
+    ref_mask = prepare.decode_nifti_zst(encoded["mask"])
+    ref_other = prepare.decode_nifti_zst(encoded["other"])
+    assert np.array_equal(np.asarray(ref_mask.dataobj), fit_mask.astype(np.uint8)), "fit mask differs"
+    assert np.array_equal(np.asarray(ref_other.dataobj), np.asarray(quant_img.dataobj)), "quantized differs"
+    assert np.array_equal(ref_other.affine, quant_img.affine), "affine differs"
+
+    values = conform_img.get_fdata(dtype=np.float32)[fit_mask]
+    vmin, vmax = np.quantile(values, (prepare.VMIN_QUANTILE, prepare.VMAX_QUANTILE))
+    branches = conform_branches(img, mask_img)
+    fwhm = branches.pop("_fwhm")
+    out_dir = out_root / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_nifti(mask_img, out_dir / "head_mask.nii.gz")
+    save_nifti(conform_img, out_dir / "conform.nii.gz")
+    save_nifti(fit_mask_img, out_dir / "fit_mask.nii.gz")
+    save_nifti(quant_img, out_dir / "quantized.nii.gz")
+    info = {
+        "scan": display_path(scan),
+        "scan_sha256": sha256_file(scan),
+        "reference": display_path(reference),
+        "reference_sha256": sha256_file(reference),
+        "shape": list(img.shape),
+        "affine": img.affine.tolist(),
+        "head_mask_voxels": int((np.asarray(mask_img.dataobj) > 0).sum()),
+        "centroid": captured["centroids"][1],
+        "fit_affine": affine.tolist(),
+        "image_affine": conform_img.affine.tolist(),
+        "fit_mask_voxels": int(fit_mask.sum()),
+        "vmin": float(vmin),
+        "vmax": float(vmax),
+        "fwhm": fwhm,
+        "branches": branches,
+        "seconds": {"mask": t1 - t0, "conform": t2 - t1, "quantize": t3 - t2},
+        "versions": versions(),
+    }
+    write_text(out_dir / "info.json", json.dumps(info, indent=2))
+    print(f"prep {name}: reference mask {info['head_mask_voxels']} vox, fit mask {info['fit_mask_voxels']} vox, "
+          f"{sum(info['seconds'].values()):.1f}s")
+    return info
+
+
 def load_model(manifest_path: Path) -> tuple[dict, nbm.ViTMAE3D]:
     manifest = tomllib.loads(manifest_path.read_text())
     arch = manifest["architecture"]
@@ -309,6 +386,19 @@ def load_manifest() -> list[dict]:
     return tomllib.loads(MANIFEST.read_text())["scan"]
 
 
+def load_pairs() -> list[dict]:
+    return tomllib.loads(MANIFEST.read_text()).get("pair", [])
+
+
+def pair_is_current(pair: dict, scans: dict) -> bool:
+    prep_dir = REFERENCE / "prep" / pair["name"]
+    if not all((prep_dir / f).exists() for f in PREP_FILES):
+        return False
+    info = json.loads((prep_dir / "info.json").read_text())
+    return (info.get("scan_sha256") == scans[pair["target"]]["sha256"]
+            and info.get("reference_sha256") == scans[pair["reference"]]["sha256"])
+
+
 def prep_is_current(scan: dict) -> bool:
     prep_dir = REFERENCE / "prep" / scan["name"]
     if not all((prep_dir / f).exists() for f in PREP_FILES):
@@ -336,8 +426,11 @@ def encode_is_current(name: str, model_id: str) -> bool:
 
 def run_all(names: list[str], force: bool) -> None:
     scans = load_manifest()
-    unknown = set(names) - {s["name"] for s in scans}
+    by_name = {s["name"]: s for s in scans}
+    pairs = load_pairs()
+    unknown = set(names) - set(by_name) - {p["name"] for p in pairs}
     assert not unknown, f"not in {MANIFEST}: {sorted(unknown)}"
+    pairs = [p for p in pairs if not names or p["name"] in names]
     scans = [s for s in scans if not names or s["name"] in names]
     t_start = time.perf_counter()
     for scan in scans:
@@ -345,12 +438,16 @@ def run_all(names: list[str], force: bool) -> None:
         assert sha256_file(path) == scan["sha256"], f"{path}: sha256 differs from the manifest"
         if force or not prep_is_current(scan):
             run_prep(path, scan["name"])
-    model_ids = sorted({m for s in scans for m in s["encode"]}, key=lambda m: m.endswith("p4-ref"))
+    for pair in pairs:
+        if force or not pair_is_current(pair, by_name):
+            target, reference = by_name[pair["target"]], by_name[pair["reference"]]
+            run_prep_pair(FIXTURES / target["file"], FIXTURES / reference["file"], pair["name"])
+    model_ids = sorted({m for s in scans + pairs for m in s["encode"]}, key=lambda m: m.endswith("p4-ref"))
     for model_id in model_ids:
-        for scan in scans:
+        for scan in scans + pairs:
             if model_id in scan["encode"] and (force or not encode_is_current(scan["name"], model_id)):
                 run_encode(scan["name"], MODELS / f"{model_id}.toml")
-    print_summary(scans, model_ids)
+    print_summary(scans + pairs, model_ids)
     print(f"all: {time.perf_counter() - t_start:.0f}s")
 
 
@@ -376,6 +473,7 @@ if __name__ == "__main__":
     prep = sub.add_parser("prep")
     prep.add_argument("scan", type=Path)
     prep.add_argument("--name", required=True)
+    prep.add_argument("--reference", type=Path, help="prepare SCAN on this scan's head mask and grid")
     enc = sub.add_parser("encode")
     enc.add_argument("name")
     enc.add_argument("--model", type=Path, required=True)
@@ -383,7 +481,9 @@ if __name__ == "__main__":
     everything.add_argument("names", nargs="*", help="only these manifest scans")
     everything.add_argument("--force", action="store_true", help="regenerate outputs that are current")
     args = parser.parse_args()
-    if args.cmd == "prep":
+    if args.cmd == "prep" and args.reference is not None:
+        run_prep_pair(args.scan, args.reference, args.name)
+    elif args.cmd == "prep":
         run_prep(args.scan, args.name)
     elif args.cmd == "encode":
         run_encode(args.name, args.model)

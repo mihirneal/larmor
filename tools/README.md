@@ -38,8 +38,9 @@ nanobrain's `src/` on `sys.path` (`NANOBRAIN_SRC` overrides it) and stubs `Synth
 | `make_models.py export CKPT --id ID` | `ID.toml` + `ID.safetensors` from a real nanobrain checkpoint (below) |
 | `fetch_fixtures.py` | `fixtures/scans/*.nii.gz`, `fixtures/manifest.toml`, `fixtures/downloads/` (the 4D series the DWI b0 is cut from), `fixtures/templateflow/` (TemplateFlow cache) |
 | `make_reference.py prep SCAN --name NAME` | `fixtures/reference/prep/NAME/`: `head_mask`, `conform`, `fit_mask`, `quantized` (.nii.gz) and `info.json` |
+| `make_reference.py prep SCAN --name NAME --reference REF` | the same for SCAN prepared on REF's head mask and grid (`prepare_images` with `reference=`); `head_mask` is REF's, `info.json` adds `reference`, `reference_sha256` and `image_affine` |
 | `make_reference.py encode NAME --model M.toml` | `fixtures/reference/encode/<model id>/NAME.safetensors` |
-| `make_reference.py all` | both of the above for every manifest scan, skipping outputs that are current |
+| `make_reference.py all` | both of the above for every manifest scan and `[[pair]]`, skipping outputs that are current |
 | `test_reference.py` | nothing; pytest consistency checks over the scans and every reference |
 | `reference/probe_*.py` | probe references for Phase 2 (owned by the probe work, see their docstrings) |
 
@@ -59,6 +60,10 @@ with an encode reference) and `notes`.
   coronal (LIA) storage; 0.43 to 2 mm, isotropic and 3 to 5 mm slices; int16, uint16, uint8 and float32;
   scl_slope unset, 0, 1 and real scaling; plus a DWI b0 cut from a 4D series.
 * **templateflow**: MNI152NLin6Asym T1w (`mni152-t1w`) and MNI152NLin2009cAsym T1w and T2w, 1 mm.
+* **pairs** (`[[pair]]`: `name`, `target`, `reference`, `encode`, `notes`): a target scan prepared on a
+  reference scan's head mask and grid, the multi-modal path of `prepare_images` (FOMO tasks 1 and 2 prepare
+  ADC and DWI on the FLAIR this way). `mni152-2009c-t2w-ref-t1w` is the 2009c T2w on the T1w's mask;
+  `check-parity` gates its fit mask, quantized volume, affines and token grid bit-exact.
 * **synthetic**: variants of `mni152-t1w` (and one of `ds001246-t1w`), each aimed at a branch:
   (0.5, 1, 3) mm resample as in nanobrain's `test_preprocessing.py`, 0.8 mm (anti-alias smoothing), LPS /
   PIR / ASL storage, a 15 degree oblique affine, qform-only and sform-only headers (with stale fields
