@@ -98,8 +98,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Fails before anything is written when two scans would write the same output file. Paths are
-/// compared case-insensitively: on macOS's and Windows' default file systems `Brain` and `brain`
-/// are the same file.
+/// compared case-insensitively: on macOS's default file system `Brain` and `brain` are the same
+/// file.
 pub fn check_unique_outputs(targets: &[(&Path, PathBuf)]) -> Result<()> {
     let mut seen: HashMap<String, &Path> = HashMap::new();
     for (scan, target) in targets {

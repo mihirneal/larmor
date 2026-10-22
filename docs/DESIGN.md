@@ -290,7 +290,7 @@ of MR heads is scarce (OpenNeuro keeps converted NIfTI, not DICOM).
 
 Reference models `nanobrain-vits-p8-ref` / `nanobrain-vits-p4-ref` are nanobrain's ViT-S config with
 `torch.manual_seed(0)` init, then every parameter perturbed so biases and norms are non-trivial. Real
-checkpoints export with `tools/export_checkpoint.py` where they live (the cluster).
+checkpoints export with `tools/make_models.py export` where they live (the cluster).
 
 ## Embedding cache
 
