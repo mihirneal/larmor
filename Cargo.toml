@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["spikes"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,7 +17,6 @@ toml = "1"
 safetensors = "0.8"
 half = "2"
 rayon = "1"
-burn = { version = "0.22.1", default-features = false, features = ["std"] }
 candle-core = { version = "0.11.0", default-features = false }
 candle-nn = { version = "0.11.0", default-features = false }
 

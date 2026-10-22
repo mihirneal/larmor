@@ -8,13 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use larmor_model::{DeviceChoice, Encoder};
+use larmor_model::{DeviceChoice, Encoder, EncoderError, Precision};
 use larmor_prep::{Prepared, Tokens};
 use larmor_volume::Nifti;
 
 use crate::cache::{self, CacheEntry};
 use crate::console::{dim, secs, yellow};
-use crate::device::{DeviceArg, PrecisionArg};
 use crate::hashing::sha256_hex;
 use crate::model::Model;
 use crate::run_info::{Encoding, RunInfo, StageSeconds, now};
@@ -131,13 +130,13 @@ impl Stager<'_> {
 /// Encodes scans with one model, loading the encoder only when a scan is not cached.
 pub struct Pipeline<'a> {
     pub stager: Stager<'a>,
-    pub device: DeviceArg,
-    pub precision: PrecisionArg,
-    encoder: Option<(Encoder, DeviceArg)>,
+    pub device: DeviceChoice,
+    pub precision: Precision,
+    encoder: Option<Encoder>,
 }
 
 impl<'a> Pipeline<'a> {
-    pub fn new(model: &'a Model, device: DeviceArg, precision: PrecisionArg, cache_root: PathBuf) -> Self {
+    pub fn new(model: &'a Model, device: DeviceChoice, precision: Precision, cache_root: PathBuf) -> Self {
         let stager = Stager { model, cache_root, force: false };
         Pipeline { stager, device, precision, encoder: None }
     }
@@ -161,14 +160,14 @@ impl<'a> Pipeline<'a> {
         };
         let Ready { scan, sha, cache_path, nifti, prepared, tokens: patch_tokens, mut seconds, started } =
             ready;
-        let (encoder, device) = self.encoder()?;
+        let encoder = self.encoder()?;
         let start = Instant::now();
         let encoded = encoder
             .encode(&patch_tokens.patches, &patch_tokens.coords)
             .with_context(|| format!("encoding {}", scan.display()))?;
         seconds.encode = start.elapsed().as_secs_f64();
 
-        let encoding = Encoding { device, precision: self.precision, seconds, started };
+        let encoding = Encoding::new(encoder, seconds, started);
         let model = self.model();
         let mut info = RunInfo::new(model, encoding, &scan, &sha, &nifti, &prepared, encoded.n_tokens)?;
         let start = Instant::now();
@@ -202,38 +201,37 @@ impl<'a> Pipeline<'a> {
     }
 
     /// The encoder, loaded on first use.
-    fn encoder(&mut self) -> Result<(&Encoder, DeviceArg)> {
+    fn encoder(&mut self) -> Result<&Encoder> {
         if self.encoder.is_none() {
             let start = Instant::now();
-            let (encoder, device) = load_encoder(self.model(), self.device, self.precision)?;
+            let encoder = load_encoder(self.model(), self.device, self.precision)?;
             let seconds = secs(start.elapsed().as_secs_f64());
-            let line = format!("loaded {} on {device} ({}) in {seconds}", self.model().id(), self.precision);
+            let options = encoder.options();
+            let line = format!(
+                "loaded {} on {} ({}) in {seconds}",
+                self.model().id(),
+                options.device,
+                options.precision
+            );
             eprintln!("{}", dim(&line));
-            self.encoder = Some((encoder, device));
+            self.encoder = Some(encoder);
         }
-        let (encoder, device) = self.encoder.as_ref().expect("loaded above");
-        Ok((encoder, *device))
+        Ok(self.encoder.as_ref().expect("loaded above"))
     }
 }
 
-/// Loads a model's encoder on the requested device and says which device it got. `auto` resolves
-/// to the GPU and falls back to the CPU, with a warning, when the GPU cannot be used.
-pub fn load_encoder(
-    model: &Model,
-    requested: DeviceArg,
-    precision: PrecisionArg,
-) -> Result<(Encoder, DeviceArg)> {
-    let device = requested.resolve();
+/// Loads a model's encoder on the requested device; [`Encoder::options`] says which device and
+/// precision it got. `auto` picks CUDA, then Metal, then the CPU. Half precision needs a GPU, so
+/// when `auto` finds none it falls back to f32 on the CPU, with a warning.
+pub fn load_encoder(model: &Model, device: DeviceChoice, precision: Precision) -> Result<Encoder> {
     let manifest = &model.manifest;
-    match Encoder::load(manifest, device.0, precision.0) {
-        Ok(encoder) => Ok((encoder, device)),
-        Err(err) if requested.0 == DeviceChoice::Auto && device.0 != DeviceChoice::Cpu => {
-            eprintln!("{} {device} unavailable ({err}); using the CPU", yellow("warning:"));
-            let cpu = DeviceArg(DeviceChoice::Cpu);
-            let encoder = Encoder::load(manifest, cpu.0, precision.0)
-                .with_context(|| format!("loading {}", model.path.display()))?;
-            Ok((encoder, cpu))
+    let loaded = match Encoder::load(manifest, device, precision) {
+        // under `auto` only the half-precision-on-the-CPU check reports a device error
+        Err(EncoderError::Device(reason)) if device == DeviceChoice::Auto && precision != Precision::F32 => {
+            eprintln!("{} no GPU found ({reason}); encoding in f32 on the CPU", yellow("warning:"));
+            Encoder::load(manifest, DeviceChoice::Cpu, Precision::F32)
         }
-        Err(err) => Err(err).with_context(|| format!("loading {}", model.path.display())),
-    }
+        other => other,
+    };
+    loaded.with_context(|| format!("loading {}", model.path.display()))
 }

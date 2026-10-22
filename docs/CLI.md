@@ -17,8 +17,8 @@ Errors print as `error: …` and exit with status 1. Colors turn off when stdout
 | Flag | Meaning |
 |---|---|
 | `--model ID\|PATH` | A model id (looked up as below) or a path to a `model.toml` |
-| `--device auto\|cpu\|metal\|cuda[:N]` | Where the encoder runs. `auto` (default): Metal on a Mac, CUDA in a `--features cuda` build, else the CPU; if that GPU cannot be used, `auto` falls back to the CPU with a warning |
-| `--precision f32\|f16\|bf16` | Encoder matmul precision. `f32` (default) is the parity target; the half types mirror PyTorch autocast |
+| `--device auto\|cpu\|metal\|cuda[:N]` | Where the encoder and the segmentation probe run. `auto` (default): CUDA in a `--features cuda` build, else Metal on a Mac, else the CPU |
+| `--precision f32\|f16\|bf16` | Encoder precision. `f32` (default) is the parity target. `f16` and `bf16` work like PyTorch autocast (linears, attention and GELU in the half type, the residual stream and norms in f32) and need a GPU; with `--device auto` and no GPU, larmor encodes in f32 on the CPU with a warning |
 
 ## Environment
 
@@ -135,7 +135,8 @@ all scans.
 | `--out FILE` | Probe file, default `probe.toml`; the weights go next to it (`probe.safetensors`) |
 | `--encode` | Encode scans that are not cached yet instead of stopping |
 | `--max-negative-ratio R` | Segmentation: keep at most `R` all-negative patches per positive patch when fitting (nanobrain's `max_negative_ratio`) |
-| `--device`, `--precision` | For `--encode` |
+| `--device` | Where the segmentation probe fits, and the encoder with `--encode` |
+| `--precision` | For `--encode` |
 
 `labels.tsv` (annotated example: `examples/labels.tsv`): tab-separated, one row per scan; `#` lines are
 comments. `scan` is a path relative to the TSV. Other columns are labels; empty and `n/a` cells are
@@ -156,17 +157,14 @@ Scans not in the cache stop the fit with a list of them and the `larmor encode` 
 the layer and pooling, the label names, the SHA-256 of `labels.tsv`, the outer-CV metrics and per-fold
 choices, and the chosen hyperparameters.
 
-Known gap: larmor-probe's segmentation solver takes its backend's own device and offers no way to build
-one from `--device`, so segmentation fits run on that backend's default device (the GPU when one is
-compiled in) whatever `--device` says.
-
 ## `larmor probe apply <probe.toml> <scan or folder>...`
 
 | Flag | |
 |---|---|
 | `--out DIR` | Output folder (default: the derivatives folder, as for `encode`) |
 | `--model ID\|PATH` | Model to embed with (default: the probe's `model_id`, looked up as usual) |
-| `--device`, `--precision` | For scans that are not cached |
+| `--device` | Where the segmentation probe predicts, and the encoder for scans that are not cached |
+| `--precision` | For scans that are not cached |
 
 Refuses a probe whose model weights SHA-256, preprocessing version or embedding width differs from the
 model's. Scans are encoded through the cache when needed.
@@ -189,8 +187,8 @@ Runs the recipe on every scan in `<fixtures>/manifest.toml` and compares each st
 `reference/prep/<scan>/`, then encodes with each model that has references in
 `reference/encode/<model>/` (manifests in `<fixtures>/models/`) and compares tokens, class tokens and
 the pooled embedding with PyTorch's fp32 output. `--models` restricts the models; `--device` and
-`--precision` choose how to encode. Prints one row per scan and model, the gates with their worst
-values, and exits 1 if any gate fails.
+`--precision` choose how to encode. Prints one row per scan and model, then each gate with its worst
+value and the scan it came from, and exits 1 if any gate fails.
 
 | Column / gate | Limit |
 |---|---|
@@ -200,12 +198,13 @@ values, and exits 1 if any gate fails.
 | vmin, vmax, centroid, fit affine, anti-alias FWHM | exactly equal |
 | tokens: in-mask patch grid equal to the reference | all scans |
 | 1-cos min / avg: per-token cosine distance | min token cosine ≥ 0.999 |
-| 1-ctr min: cosine distance after centering each side's tokens | reported |
+| 1-ctr min: cosine distance after subtracting the reference's mean token from both sides | reported |
 | 1-pooled: pooled embedding cosine distance | pooled cosine ≥ 0.999 |
 | max abs Δ of the tokens | reported |
 
-Also printed: PyTorch's own bf16-vs-fp32 cosines from the reference metadata (the noise floor of the
-eval framework's bf16 autocast) and the mean encode time.
+Also printed: the worst centered cosine and max abs Δ with their scans, the mean encode time, and
+PyTorch's own bf16-vs-fp32 cosines from the reference metadata (the noise floor of the eval framework's
+bf16 autocast).
 
 ## `larmor bench`
 

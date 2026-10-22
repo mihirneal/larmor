@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use larmor_model::{DeviceChoice, Precision};
 use larmor_probe::Matrix;
 use larmor_probe::fit::{
     Provenance, fit_classification_probe, fit_regression_probe, fit_segmentation_probe_file,
@@ -17,7 +18,7 @@ use larmor_volume::{Affine, Nifti, VoxelData};
 
 use crate::cache::{self, CacheEntry};
 use crate::console::{bold, dim, green, secs, with_ci, yellow};
-use crate::device::{self, DeviceArg, PrecisionArg};
+use crate::device;
 use crate::encode_cmd::prepare_again;
 use crate::hashing::sha256_hex;
 use crate::labels::{LabelColumn, LabelTable};
@@ -42,8 +43,8 @@ pub struct FitOptions {
     pub kind: Kind,
     pub label: String,
     pub out: PathBuf,
-    pub device: DeviceArg,
-    pub precision: PrecisionArg,
+    pub device: DeviceChoice,
+    pub precision: Precision,
     pub encode: bool,
     pub max_negative_ratio: Option<f64>,
 }
@@ -160,7 +161,7 @@ fn fit_segmentation(fit: &FitInput, entries: Vec<CacheEntry>, options: &FitOptio
         max_negative_ratio: options.max_negative_ratio,
         ..SegmentationOptions::default()
     };
-    let device = device::segmentation_device(options.device);
+    let device = device::segmentation_device(options.device)?;
     let provenance = fit.provenance(vec![fit.column.name.clone()]);
     let (probe, cv) = fit_segmentation_probe_file(&subjects, fit.folds(), &settings, &provenance, &device)?;
     let r = &cv.report;
@@ -269,8 +270,8 @@ pub struct ApplyOptions {
     pub inputs: Vec<PathBuf>,
     pub out: Option<PathBuf>,
     pub model: Option<String>,
-    pub device: DeviceArg,
-    pub precision: PrecisionArg,
+    pub device: DeviceChoice,
+    pub precision: Precision,
 }
 
 pub fn cmd_probe_apply(options: ApplyOptions) -> Result<()> {
@@ -383,9 +384,9 @@ fn apply_segmentation(
     scans: &[PathBuf],
     pipeline: &mut Pipeline,
     out: Option<&Path>,
-    device_arg: DeviceArg,
+    device: DeviceChoice,
 ) -> Result<()> {
-    let device = device::segmentation_device(device_arg);
+    let device = device::segmentation_device(device)?;
     for scan in scans {
         let start = Instant::now();
         let ScanResult { entry, nifti, prepared, .. } = pipeline.run(scan, true)?;

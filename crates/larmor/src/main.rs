@@ -24,9 +24,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use larmor_model::{DeviceChoice, Precision};
 
 use crate::console::red;
-use crate::device::{DeviceArg, PrecisionArg};
 use crate::probe_cmd::Kind;
 
 #[derive(Parser)]
@@ -59,12 +59,13 @@ enum Cmd {
 /// Where the encoder runs.
 #[derive(Args, Clone, Copy)]
 struct ComputeArgs {
-    /// auto, cpu, metal, cuda or cuda:N (auto: Metal on a Mac, CUDA when built with it).
+    /// auto, cpu, metal, cuda or cuda:N (auto: CUDA when built with it, else Metal on a Mac, else
+    /// the CPU).
     #[arg(long, default_value = "auto")]
-    device: DeviceArg,
-    /// Encoder matmul precision: f32 (the parity target), f16 or bf16.
+    device: DeviceChoice,
+    /// Encoder precision: f32 (the parity target), or f16 or bf16 (GPU only, like PyTorch autocast).
     #[arg(long, default_value = "f32")]
-    precision: PrecisionArg,
+    precision: Precision,
 }
 
 #[derive(Args)]

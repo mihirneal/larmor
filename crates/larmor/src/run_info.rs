@@ -4,11 +4,11 @@
 use std::path::Path;
 
 use anyhow::Result;
+use larmor_model::{DeviceChoice, Encoder, Precision};
 use larmor_prep::{IMPL_VERSION, Prepared};
 use larmor_volume::{Nifti, aff2axcodes};
 use serde::{Deserialize, Serialize};
 
-use crate::device::{DeviceArg, PrecisionArg};
 use crate::model::Model;
 
 /// One scan's encode record.
@@ -128,11 +128,19 @@ pub struct CacheInfo {
 
 /// How an embedding was computed, for its [`RunInfo`].
 pub struct Encoding {
-    pub device: DeviceArg,
-    pub precision: PrecisionArg,
+    pub device: DeviceChoice,
+    pub precision: Precision,
     pub seconds: StageSeconds,
     /// When the scan was read.
     pub started: String,
+}
+
+impl Encoding {
+    /// The device and precision `encoder` actually runs with, and the stage timings.
+    pub fn new(encoder: &Encoder, seconds: StageSeconds, started: String) -> Encoding {
+        let options = encoder.options();
+        Encoding { device: options.device, precision: options.precision, seconds, started }
+    }
 }
 
 impl RunInfo {

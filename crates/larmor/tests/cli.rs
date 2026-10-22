@@ -142,6 +142,16 @@ fn encode_writes_bids_outputs_and_reuses_the_cache() {
 }
 
 #[test]
+fn half_precision_on_the_cpu_is_refused() {
+    let ws = Workspace::new();
+    ws.tiny_model("tiny", 1);
+    write_scan(&ws.path("scan.nii.gz"), &Subject::nth(0));
+    let err =
+        ws.fails(&["encode", "scan.nii.gz", "--model", "tiny", "--device", "cpu", "--precision", "f16"]);
+    assert!(err.contains("f16 needs a GPU") && err.contains("1 of 1 scans failed"), "{err}");
+}
+
+#[test]
 fn models_list_verify_and_download() {
     let ws = Workspace::new();
     ws.tiny_model("tiny", 1);

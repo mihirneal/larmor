@@ -1,7 +1,0 @@
-== repeat-vits-p8: bench --model /Users/mihir/Developer/larmor/fixtures/models/nanobrain-vits-p8-ref.toml --input /Users/mihir/Developer/larmor/fixtures/reference/encode/nanobrain-vits-p8-ref/mni152-t1w.safetensors --precision f32,f16,bf16,bf16-mixed --attention fused --bias folded --runs 7
-bench nanobrain-vits-p8-ref: 8150 tokens (+1 cls), width 384 depth 12 heads 6, warmup 2, runs 7, fast math true
-options                           median ms     min ms     max ms    cold ms  peak GiB  base GiB
-f32 fused folded                      156.8      152.6      185.9      368.5      0.46      0.16
-f16 fused folded                      149.9      126.5      161.0      439.7      0.27      0.12
-bf16 fused folded                     201.5      126.9      270.0      134.6      0.27      0.12
-bf16-mixed fused folded               198.4      137.9      369.1      133.0      0.34      0.11

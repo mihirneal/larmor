@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use larmor_model::{DeviceChoice, Precision};
 use larmor_prep::Prepared;
 use larmor_volume::{Nifti, VoxelData};
 
 use crate::console::{bold, dim, green, red, secs};
-use crate::device::{DeviceArg, PrecisionArg};
 use crate::locate;
 use crate::model::Model;
 use crate::outputs::{self, ScanOutputs};
@@ -21,8 +21,8 @@ pub struct EncodeOptions {
     pub inputs: Vec<PathBuf>,
     pub model: String,
     pub out: Option<PathBuf>,
-    pub device: DeviceArg,
-    pub precision: PrecisionArg,
+    pub device: DeviceChoice,
+    pub precision: Precision,
     pub force: bool,
     pub save_preprocessed: bool,
 }

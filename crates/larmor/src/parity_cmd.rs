@@ -4,14 +4,13 @@
 //! The comparisons are those of `larmor-prep`'s `tests/fixtures.rs` and `larmor-model`'s parity
 //! module, run on every scan in `<fixtures>/manifest.toml`.
 
-use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
-use larmor_model::Encoder;
-use larmor_model::parity::{EncodeReference, cosine, row_cosines};
+use larmor_model::parity::{EncodeReference, compare};
+use larmor_model::{DeviceChoice, Encoder, Precision};
 use larmor_prep::{Prepared, Recipe};
 use larmor_volume::ndarray::{Array3, Ix3};
 use larmor_volume::{Nifti, VoxelData};
@@ -19,7 +18,6 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::console::{bold, dim, green, red, secs};
-use crate::device::{DeviceArg, PrecisionArg};
 use crate::hashing::sha256_hex;
 use crate::model::Model;
 use crate::pipeline::load_encoder;
@@ -38,8 +36,8 @@ pub struct ParityOptions {
     pub fixtures: PathBuf,
     /// Only these model ids; all with an encode reference when `None`.
     pub models: Option<Vec<String>>,
-    pub device: DeviceArg,
-    pub precision: PrecisionArg,
+    pub device: DeviceChoice,
+    pub precision: Precision,
 }
 
 /// `<fixtures>/manifest.toml` (only the fields used here).
@@ -79,6 +77,7 @@ struct EncodeReport {
     coords_equal: bool,
     min_cosine: f64,
     mean_cosine: f64,
+    /// Smallest token cosine after subtracting the reference's mean token from both sides.
     min_centered: f64,
     pooled_cosine: f64,
     max_abs_diff: f64,
@@ -105,10 +104,10 @@ impl ScanReport {
     }
 }
 
-/// A reference model and, once loaded, its encoder.
+/// A reference model and its encoder.
 struct ReferenceModel {
     model: Model,
-    encoder: Option<Encoder>,
+    encoder: Encoder,
 }
 
 pub fn cmd_check_parity(options: ParityOptions) -> Result<()> {
@@ -120,12 +119,16 @@ pub fn cmd_check_parity(options: ParityOptions) -> Result<()> {
     let manifest: FixtureManifest =
         toml::from_str(&text).with_context(|| format!("parsing {}", manifest_path.display()))?;
     ensure!(!manifest.scan.is_empty(), "{} lists no scans", manifest_path.display());
-    let mut models = reference_models(root, options.models.as_deref())?;
+    let models = reference_models(root, options.models.as_deref(), options.device, options.precision)?;
     // make_reference.py's prep references always use the nanobrain-eval recipe
     let prep_recipe = Recipe::nanobrain_eval();
 
+    let encoding = models.values().next().map_or_else(
+        || "no encoder".to_string(),
+        |m| format!("device {} · {}", m.encoder.options().device, m.encoder.options().precision),
+    );
     println!(
-        "{}  {} scans · models {} · device {} · {}",
+        "{}  {} scans · models {} · {encoding}",
         bold("larmor check-parity"),
         manifest.scan.len(),
         if models.is_empty() {
@@ -133,13 +136,11 @@ pub fn cmd_check_parity(options: ParityOptions) -> Result<()> {
         } else {
             models.keys().cloned().collect::<Vec<_>>().join(", ")
         },
-        options.device.resolve(),
-        options.precision
     );
     print_header();
     let mut reports = Vec::new();
     for scan in &manifest.scan {
-        let report = check_scan(root, scan, &prep_recipe, &mut models, &options);
+        let report = check_scan(root, scan, &prep_recipe, &models);
         print_rows(&report);
         reports.push(report);
     }
@@ -150,8 +151,13 @@ pub fn cmd_check_parity(options: ParityOptions) -> Result<()> {
     Ok(())
 }
 
-/// Every model with a folder in `reference/encode/`, or the ones `--models` names.
-fn reference_models(root: &Path, only: Option<&[String]>) -> Result<BTreeMap<String, ReferenceModel>> {
+/// Every model with a folder in `reference/encode/`, or the ones `--models` names, with its encoder.
+fn reference_models(
+    root: &Path,
+    only: Option<&[String]>,
+    device: DeviceChoice,
+    precision: Precision,
+) -> Result<BTreeMap<String, ReferenceModel>> {
     let encode_dir = root.join("reference/encode");
     let mut ids: Vec<String> = match std::fs::read_dir(&encode_dir) {
         Ok(entries) => entries
@@ -172,7 +178,8 @@ fn reference_models(root: &Path, only: Option<&[String]>) -> Result<BTreeMap<Str
     for id in ids {
         let path = root.join("models").join(format!("{id}.toml"));
         let model = Model::load(&path).with_context(|| format!("reference model {id}"))?;
-        models.insert(id, ReferenceModel { model, encoder: None });
+        let encoder = load_encoder(&model, device, precision)?;
+        models.insert(id, ReferenceModel { model, encoder });
     }
     Ok(models)
 }
@@ -181,12 +188,11 @@ fn check_scan(
     root: &Path,
     scan: &FixtureScan,
     prep_recipe: &Recipe,
-    models: &mut BTreeMap<String, ReferenceModel>,
-    options: &ParityOptions,
+    models: &BTreeMap<String, ReferenceModel>,
 ) -> ScanReport {
     let start = Instant::now();
     let mut report = ScanReport { name: scan.name.clone(), ..ScanReport::default() };
-    if let Err(err) = check_scan_inner(root, scan, prep_recipe, models, options, &mut report) {
+    if let Err(err) = check_scan_inner(root, scan, prep_recipe, models, &mut report) {
         report.failures.push(format!("{err:#}"));
     }
     report.seconds = start.elapsed().as_secs_f64();
@@ -197,8 +203,7 @@ fn check_scan_inner(
     root: &Path,
     scan: &FixtureScan,
     prep_recipe: &Recipe,
-    models: &mut BTreeMap<String, ReferenceModel>,
-    options: &ParityOptions,
+    models: &BTreeMap<String, ReferenceModel>,
     report: &mut ScanReport,
 ) -> Result<()> {
     let path = root.join(&scan.file);
@@ -216,15 +221,14 @@ fn check_scan_inner(
     });
     report.prep = Some(compare_prep(&references, &prepared, report));
 
-    for (id, reference_model) in models.iter_mut() {
+    for (id, reference_model) in models {
         let reference_path =
             root.join("reference/encode").join(id).join(format!("{}.safetensors", scan.name));
         if !reference_path.is_file() {
             continue;
         }
-        let encode =
-            compare_encode(reference_model, &reference_path, &nifti, &prepared, prep_recipe, options)
-                .with_context(|| id.clone())?;
+        let encode = compare_encode(reference_model, &reference_path, &nifti, &prepared, prep_recipe)
+            .with_context(|| id.clone())?;
         report.gate(encode.coords_equal, || {
             format!(
                 "{id}: {} tokens vs reference {} (or different coords)",
@@ -404,15 +408,13 @@ fn compare_prep(refs: &PrepReferences, prepared: &Prepared, report: &mut ScanRep
 }
 
 fn compare_encode(
-    reference_model: &mut ReferenceModel,
+    reference_model: &ReferenceModel,
     path: &Path,
     nifti: &Nifti,
     prepared: &Prepared,
     prep_recipe: &Recipe,
-    options: &ParityOptions,
 ) -> Result<EncodeReport> {
     let model = &reference_model.model;
-    let patch = model.patch();
     let own_prepared;
     let prepared = if model.recipe == *prep_recipe {
         prepared
@@ -420,14 +422,9 @@ fn compare_encode(
         own_prepared = model.recipe.run(nifti)?;
         &own_prepared
     };
-    let tokens = prepared.tokens(patch)?;
-    if reference_model.encoder.is_none() {
-        reference_model.encoder = Some(load_encoder(model, options.device, options.precision)?.0);
-    }
-    let encoder = reference_model.encoder.as_ref().expect("loaded above");
+    let tokens = prepared.tokens(model.patch())?;
     let reference = EncodeReference::load(path)?;
-    let metadata = safetensors_metadata(path)?;
-    let floor = |key: &str| metadata.get(key).and_then(|v| v.parse::<f64>().ok());
+    let floor = reference.bf16_noise_floor();
     let mut report = EncodeReport {
         model: model.id().to_string(),
         tokens: tokens.len(),
@@ -438,60 +435,24 @@ fn compare_encode(
         min_centered: f64::NAN,
         pooled_cosine: f64::NAN,
         max_abs_diff: f64::NAN,
-        bf16_min_cosine: floor("bf16_min_token_cosine"),
-        bf16_pooled_cosine: floor("bf16_pooled_cosine"),
+        bf16_min_cosine: floor.map(|f| f.min_token_cosine),
+        bf16_pooled_cosine: floor.map(|f| f.pooled_cosine),
         seconds: 0.0,
     };
     if !report.coords_equal {
         return Ok(report);
     }
     let start = Instant::now();
-    let encoded = encoder.encode(&tokens.patches, &tokens.coords)?;
+    let encoded = reference_model.encoder.encode(&tokens.patches, &tokens.coords)?;
     report.seconds = start.elapsed().as_secs_f64();
-    let width = encoded.width;
-    ensure!(width == reference.width, "width {width} vs reference {}", reference.width);
-    let cosines = row_cosines(&encoded.tokens, &reference.tokens, width);
-    report.min_cosine = cosines.iter().copied().fold(f64::INFINITY, f64::min);
-    report.mean_cosine = cosines.iter().sum::<f64>() / cosines.len().max(1) as f64;
-    let centered =
-        row_cosines(&centered_rows(&encoded.tokens, width), &centered_rows(&reference.tokens, width), width);
-    report.min_centered = centered.iter().copied().fold(f64::INFINITY, f64::min);
-    report.pooled_cosine = cosine(&encoded.pooled, &reference.pooled);
-    report.max_abs_diff = encoded
-        .tokens
-        .iter()
-        .zip(&reference.tokens)
-        .fold(0f64, |m, (&a, &b)| m.max((f64::from(a) - f64::from(b)).abs()));
+    ensure!(encoded.width == reference.width, "width {} vs reference {}", encoded.width, reference.width);
+    let parity = compare(&encoded, &reference);
+    report.min_cosine = parity.min_token_cosine;
+    report.mean_cosine = parity.mean_token_cosine;
+    report.min_centered = parity.min_centered_cosine;
+    report.pooled_cosine = parity.pooled_cosine;
+    report.max_abs_diff = parity.max_abs_diff;
     Ok(report)
-}
-
-/// Rows minus their column mean, so a model that outputs near-constant tokens cannot score a high
-/// cosine.
-fn centered_rows(values: &[f32], width: usize) -> Vec<f32> {
-    let rows = (values.len() / width).max(1) as f64;
-    let mut mean = vec![0f64; width];
-    for row in values.chunks_exact(width) {
-        for (m, &v) in mean.iter_mut().zip(row) {
-            *m += f64::from(v) / rows;
-        }
-    }
-    values
-        .chunks_exact(width)
-        .flat_map(|row| row.iter().zip(&mean).map(|(&v, &m)| (f64::from(v) - m) as f32))
-        .collect()
-}
-
-/// The `__metadata__` of a safetensors file, read from its header alone.
-fn safetensors_metadata(path: &Path) -> Result<HashMap<String, String>> {
-    let mut file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut len = [0u8; 8];
-    file.read_exact(&mut len)?;
-    let len = u64::from_le_bytes(len);
-    ensure!(len < 1 << 27, "{}: implausible safetensors header", path.display());
-    let mut header = vec![0u8; len as usize];
-    file.read_exact(&mut header)?;
-    let header: Value = serde_json::from_slice(&header)?;
-    Ok(serde_json::from_value(header["__metadata__"].clone()).unwrap_or_default())
 }
 
 fn print_header() {
@@ -572,84 +533,133 @@ fn print_rows(report: &ScanReport) {
     }
 }
 
-/// Prints the gates with their worst values; returns the number of failing scans.
+/// Prints the gates with their worst values and the scans they came from; returns the number of
+/// failing scans.
 fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceModel>, seconds: f64) -> usize {
-    let preps: Vec<&PrepReport> = reports.iter().filter_map(|r| r.prep.as_ref()).collect();
-    let worst = |f: &dyn Fn(&PrepReport) -> f64, max: bool| {
-        let values = preps.iter().map(|p| f(p));
-        if max { values.fold(f64::NEG_INFINITY, f64::max) } else { values.fold(f64::INFINITY, f64::min) }
+    let preps: Vec<(&str, &PrepReport)> =
+        reports.iter().filter_map(|r| Some((r.name.as_str(), r.prep.as_ref()?))).collect();
+    let prep_worst = |f: fn(&PrepReport) -> f64, worse: Worse| {
+        worst(&preps.iter().map(|(n, p)| (*n, f(p))).collect::<Vec<_>>(), worse)
     };
-    let head = worst(&|p| p.head_disagree as f64 / p.head_voxels.max(1) as f64, true);
-    let fit = worst(&|p| p.fit_disagree as f64 / p.fit_voxels.max(1) as f64, true);
-    let conform = worst(&|p| p.conform_rel, true);
-    let conform_exact = worst(&|p| p.conform_exact, false);
-    let quant = worst(&|p| p.quant_exact, false);
-    let quant_diff = preps.iter().map(|p| p.quant_max_diff).max().unwrap_or(0);
-    let scalars = preps.iter().filter(|p| p.scalars_exact).count();
+    let head = prep_worst(|p| p.head_disagree as f64 / p.head_voxels.max(1) as f64, Worse::Larger);
+    let fit = prep_worst(|p| p.fit_disagree as f64 / p.fit_voxels.max(1) as f64, Worse::Larger);
+    let conform = prep_worst(|p| p.conform_rel, Worse::Larger);
+    let conform_exact = prep_worst(|p| p.conform_exact, Worse::Smaller);
+    let quant = prep_worst(|p| p.quant_exact, Worse::Smaller);
+    let quant_diff = preps.iter().map(|(_, p)| p.quant_max_diff).max().unwrap_or(0);
+    let not_exact: Vec<&str> = reports
+        .iter()
+        .filter(|r| !r.prep.as_ref().is_some_and(|p| p.scalars_exact))
+        .map(|r| r.name.as_str())
+        .collect();
 
-    println!("\n{}", bold("Gates (worst scan)"));
-    let row = |name: &str, value: String, limit: &str, ok: bool| {
-        println!("  {name:<44} {value:>28}   {limit:<10} {}", if ok { green("pass") } else { red("FAIL") });
+    println!("\n{}", bold("Gates"));
+    println!(
+        "  {}",
+        dim(&format!("{:<44} {:>28}  {:<26} {:<10}", "gate", "worst value", "worst scan", "limit"))
+    );
+    let row = |name: &str, value: String, scan: &str, limit: &str, ok: bool| {
+        let status = if ok { green("pass") } else { red("FAIL") };
+        println!("  {name:<44} {value:>28}  {scan:<26} {limit:<10} {status}");
     };
     let have_prep = preps.len() == reports.len() && !preps.is_empty();
     row(
         "head mask disagreement",
-        format!("{:.4}%", 100.0 * head),
+        format!("{:.4}%", 100.0 * head.value),
+        head.scan,
         "≤ 0.01%",
-        have_prep && head <= MAX_MASK_DISAGREE,
+        have_prep && head.value <= MAX_MASK_DISAGREE,
     );
     row(
         "fit mask disagreement",
-        format!("{:.4}%", 100.0 * fit),
+        format!("{:.4}%", 100.0 * fit.value),
+        fit.scan,
         "≤ 0.01%",
-        have_prep && fit <= MAX_MASK_DISAGREE,
+        have_prep && fit.value <= MAX_MASK_DISAGREE,
     );
     row(
         "conform relative error",
-        format!("{conform:.2e} ({:.2}% exact)", 100.0 * conform_exact),
+        format!("{:.2e} ({:.2}% exact)", conform.value, 100.0 * conform_exact.value),
+        conform.scan,
         "≤ 1e-5",
-        have_prep && conform <= MAX_CONFORM_REL,
+        have_prep && conform.value <= MAX_CONFORM_REL,
     );
     row(
         "quantized exact (in-mask voxels)",
-        format!("{:.4}% (max Δ {quant_diff})", 100.0 * quant),
+        format!("{:.4}% (max Δ {quant_diff})", 100.0 * quant.value),
+        quant.scan,
         "≥ 99.99%",
-        have_prep && quant >= MIN_QUANT_EXACT,
+        have_prep && quant.value >= MIN_QUANT_EXACT,
     );
     row(
         "vmin, vmax, centroid, fit affine, fwhm exact",
-        format!("{scalars}/{} scans", reports.len()),
+        format!("{}/{} scans", reports.len() - not_exact.len(), reports.len()),
+        not_exact.first().copied().unwrap_or("-"),
         "all",
-        scalars == reports.len(),
+        not_exact.is_empty(),
     );
     for id in models.keys() {
-        let encodes: Vec<&EncodeReport> =
-            reports.iter().flat_map(|r| &r.encodes).filter(|e| e.model == *id).collect();
+        let encodes: Vec<(&str, &EncodeReport)> = reports
+            .iter()
+            .flat_map(|r| r.encodes.iter().map(move |e| (r.name.as_str(), e)))
+            .filter(|(_, e)| e.model == *id)
+            .collect();
         if encodes.is_empty() {
             continue;
         }
-        let aligned = encodes.iter().filter(|e| e.coords_equal).count();
-        let min_token = encodes.iter().map(|e| e.min_cosine).fold(f64::INFINITY, nan_min);
-        let pooled = encodes.iter().map(|e| e.pooled_cosine).fold(f64::INFINITY, nan_min);
-        let mean_time = encodes.iter().map(|e| e.seconds).sum::<f64>() / encodes.len() as f64;
+        let encode_worst = |f: fn(&EncodeReport) -> f64, worse: Worse| {
+            worst(&encodes.iter().map(|(n, e)| (*n, f(e))).collect::<Vec<_>>(), worse)
+        };
+        let misaligned: Vec<&str> =
+            encodes.iter().filter(|(_, e)| !e.coords_equal).map(|(n, _)| *n).collect();
         row(
             &format!("{id}: token grid equal"),
-            format!("{aligned}/{} scans", encodes.len()),
+            format!("{}/{} scans", encodes.len() - misaligned.len(), encodes.len()),
+            misaligned.first().copied().unwrap_or("-"),
             "all",
-            aligned == encodes.len(),
+            misaligned.is_empty(),
         );
-        row(&format!("{id}: min token cosine"), cosine_text(min_token), "≥ 0.999", min_token >= MIN_COSINE);
-        row(&format!("{id}: pooled cosine"), cosine_text(pooled), "≥ 0.999", pooled >= MIN_COSINE);
-        let floor_token = encodes.iter().filter_map(|e| e.bf16_min_cosine).fold(f64::INFINITY, f64::min);
-        let floor_pooled = encodes.iter().filter_map(|e| e.bf16_pooled_cosine).fold(f64::INFINITY, f64::min);
+        let min_token = encode_worst(|e| e.min_cosine, Worse::Smaller);
+        row(
+            &format!("{id}: min token cosine"),
+            cosine_text(min_token.value),
+            min_token.scan,
+            "≥ 0.999",
+            min_token.value >= MIN_COSINE,
+        );
+        let pooled = encode_worst(|e| e.pooled_cosine, Worse::Smaller);
+        row(
+            &format!("{id}: pooled cosine"),
+            cosine_text(pooled.value),
+            pooled.scan,
+            "≥ 0.999",
+            pooled.value >= MIN_COSINE,
+        );
+
+        let centered = encode_worst(|e| e.min_centered, Worse::Smaller);
+        let max_diff = encode_worst(|e| e.max_abs_diff, Worse::Larger);
+        let mean_time = encodes.iter().map(|(_, e)| e.seconds).sum::<f64>() / encodes.len() as f64;
+        println!(
+            "  {}",
+            dim(&format!(
+                "{id}: also min centered cosine {} ({}), max |Δ| {:.2e} ({}); encode {} per scan",
+                cosine_text(centered.value),
+                centered.scan,
+                max_diff.value,
+                max_diff.scan,
+                secs(mean_time)
+            ))
+        );
+        let floor_token = encodes.iter().filter_map(|(_, e)| e.bf16_min_cosine).fold(f64::INFINITY, f64::min);
+        let floor_pooled =
+            encodes.iter().filter_map(|(_, e)| e.bf16_pooled_cosine).fold(f64::INFINITY, f64::min);
         if floor_token.is_finite() {
             println!(
                 "  {}",
                 dim(&format!(
-                    "{id}: PyTorch's own bf16 vs fp32 (noise floor): min token cosine {}, pooled {}; encode {} per scan",
+                    "{id}: PyTorch's own bf16 vs fp32 (noise floor): min token cosine {}, pooled {}",
                     cosine_text(floor_token),
                     cosine_text(floor_pooled),
-                    secs(mean_time)
                 ))
             );
         }
@@ -672,12 +682,56 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
     failed
 }
 
+/// Which direction of a metric is worse.
+#[derive(Clone, Copy)]
+enum Worse {
+    Larger,
+    Smaller,
+}
+
+/// The worst value of a metric over the scans, and the scan it came from.
+#[derive(Debug, PartialEq)]
+struct Worst<'a> {
+    /// The scan, `all scans` when every scan has the same value, or `-` when there are none.
+    scan: &'a str,
+    value: f64,
+}
+
+/// The worst of `(scan, value)` pairs. NaN (a comparison that could not run) is worst of all.
+fn worst<'a>(values: &[(&'a str, f64)], worse: Worse) -> Worst<'a> {
+    let is_worse = |a: f64, b: f64| {
+        a.is_nan()
+            || (!b.is_nan()
+                && match worse {
+                    Worse::Larger => a > b,
+                    Worse::Smaller => a < b,
+                })
+    };
+    let Some(&(scan, value)) = values.iter().reduce(|w, v| if is_worse(v.1, w.1) { v } else { w }) else {
+        return Worst { scan: "-", value: f64::NAN };
+    };
+    let tie = values.len() > 1 && values.iter().all(|&(_, v)| v == value);
+    Worst { scan: if tie { "all scans" } else { scan }, value }
+}
+
 /// A cosine near 1 with its distance from 1: `0.999999 (1-cos 1.7e-12)`.
 fn cosine_text(cosine: f64) -> String {
     format!("{cosine:.6} (1-cos {:.1e})", 1.0 - cosine)
 }
 
-/// The minimum, with NaN (a comparison that could not run) winning.
-fn nan_min(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worst_names_the_extreme_scan() {
+        let values = [("a", 0.5), ("b", 0.9), ("c", 0.1)];
+        assert_eq!(worst(&values, Worse::Larger), Worst { scan: "b", value: 0.9 });
+        assert_eq!(worst(&values, Worse::Smaller), Worst { scan: "c", value: 0.1 });
+        assert_eq!(worst(&[("a", f64::NAN), ("b", 0.1)], Worse::Smaller).scan, "a");
+        assert_eq!(worst(&[("a", 0.1), ("b", f64::NAN)], Worse::Smaller).scan, "b");
+        assert_eq!(worst(&[("a", 0.0), ("b", 0.0)], Worse::Larger), Worst { scan: "all scans", value: 0.0 });
+        assert_eq!(worst(&[("a", 0.0)], Worse::Larger).scan, "a");
+        assert_eq!(worst(&[], Worse::Larger).scan, "-");
+    }
 }

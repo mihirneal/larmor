@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Result, ensure};
+use larmor_model::{DeviceChoice, Precision};
 use larmor_volume::Nifti;
 use serde::Serialize;
 
 use crate::cache::CacheEntry;
 use crate::console::{bold, dim, secs};
-use crate::device::{DeviceArg, PrecisionArg};
 use crate::hashing::sha256_hex;
 use crate::machine::{Load, Machine};
 use crate::model::{self, Model};
@@ -23,8 +23,8 @@ pub struct BenchOptions {
     pub model: Option<String>,
     pub scan: Option<PathBuf>,
     pub runs: usize,
-    pub device: DeviceArg,
-    pub precision: PrecisionArg,
+    pub device: DeviceChoice,
+    pub precision: Precision,
     pub json: bool,
 }
 
@@ -69,12 +69,13 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
     let (scan, scan_source) = choose_scan(options.scan.as_deref(), scratch)?;
     let load = Load::now();
     let start = Instant::now();
-    let (encoder, device) = load_encoder(&model, options.device, options.precision)?;
+    let encoder = load_encoder(&model, options.device, options.precision)?;
     let encoder_load_seconds = start.elapsed().as_secs_f64();
+    let (device, precision) = (encoder.options().device, encoder.options().precision);
     let progress = !options.json && std::io::stderr().is_terminal();
     if !options.json {
         println!("{}  {}", bold("larmor bench"), machine.describe());
-        println!("  model {} ({model_source}) on {device} ({})", bold(model.id()), options.precision);
+        println!("  model {} ({model_source}) on {device} ({precision})", bold(model.id()));
         println!("  scan {} ({scan_source})", scan.display());
     }
 
@@ -108,7 +109,7 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
             encode_cold_seconds = s.encode;
         }
         tokens = encoded.n_tokens;
-        let encoding = Encoding { device, precision: options.precision, seconds: s.clone(), started: now() };
+        let encoding = Encoding::new(&encoder, s.clone(), now());
         let info = RunInfo::new(&model, encoding, &scan, &sha, &nifti, &prepared, tokens)?;
         let start = Instant::now();
         CacheEntry::write(
@@ -165,7 +166,7 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
         scan: scan.display().to_string(),
         scan_source,
         device: device.to_string(),
-        precision: options.precision.to_string(),
+        precision: precision.to_string(),
         runs: options.runs,
         tokens,
         encoder_load_seconds,
