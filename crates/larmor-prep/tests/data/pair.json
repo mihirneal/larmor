@@ -1,0 +1,12 @@
+{
+ "pair": {
+  "fov": [
+   24.0,
+   32.0,
+   24.0
+  ],
+  "patch": 4,
+  "target_alone_tokens": 214,
+  "tokens": 199
+ }
+}

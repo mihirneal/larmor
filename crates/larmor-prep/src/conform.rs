@@ -36,24 +36,63 @@ pub struct Conformed {
 /// top; `rescale_affine`; and `resample_from_to(order)`.
 pub fn conform_image(nifti: &Nifti, mask: &Volume<u8>, config: &Conform) -> Result<Conformed, PrepError> {
     let scan = Scan::of(nifti)?;
+    let placement = place_grid(&scan, mask, config)?;
+    let canonical = canonical_f32(nifti, &scan, &placement.ornt)?;
+    let (canonical, fwhm) = anti_alias(canonical, config.min_voxel_size)?;
+    let order = Interpolation::from_order(config.order).expect("order validated by the recipe");
+    let data = resample_from_to(
+        canonical.data.view(),
+        &placement.canonical_affine,
+        placement.shape,
+        &placement.affine,
+        order,
+    )
+    .ok_or(PrepError::SingularAffine)?;
+    Ok(Conformed {
+        image: Volume::new(data, placement.affine),
+        centroid: placement.centroid,
+        fwhm,
+        canonical_affine: placement.canonical_affine,
+    })
+}
+
+/// Where [`conform_image`] puts the model grid for a scan and its head mask, without resampling
+/// anything.
+pub(crate) struct GridPlacement {
+    /// The scan's orientation, used to reorient it to RAS+.
+    pub(crate) ornt: Orientation,
+    /// Affine of the scan after reorientation to RAS+.
+    pub(crate) canonical_affine: Affine,
+    /// RAS+ voxel the grid centre maps to.
+    pub(crate) centroid: [i64; 3],
+    /// The grid shape.
+    pub(crate) shape: [usize; 3],
+    /// The grid's affine.
+    pub(crate) affine: Affine,
+}
+
+/// The grid placement of `conform_image`: the RAS+ affine, the mask-derived centroid and
+/// `rescale_affine`. `mask` must be on the scan's voxel grid.
+pub(crate) fn place_grid(
+    scan: &Scan,
+    mask: &Volume<u8>,
+    config: &Conform,
+) -> Result<GridPlacement, PrepError> {
     if mask.shape() != scan.shape {
         return Err(PrepError::MaskShape { mask: mask.shape(), scan: scan.shape });
     }
     let ornt = io_orientation(&scan.affine)?;
-    let canonical = canonical_f32(nifti, &scan, &ornt)?;
-    let canonical_affine = canonical.affine;
-    let voxel_sizes = canonical.zooms;
-    let canonical_shape = canonical.shape();
-
-    let (canonical, fwhm) = anti_alias(canonical, config.min_voxel_size)?;
-    let centroid = grid_centroid(ornt.apply(mask.data.view()), voxel_sizes, canonical_shape[2], config)?;
-
-    let new_shape = config.fov.map(|w| (w / config.min_voxel_size).ceil() as usize);
-    let new_affine = rescale_affine(&canonical_affine, [config.min_voxel_size; 3], new_shape, centroid);
-    let order = Interpolation::from_order(config.order).expect("order validated by the recipe");
-    let data = resample_from_to(canonical.data.view(), &canonical_affine, new_shape, &new_affine, order)
-        .ok_or(PrepError::SingularAffine)?;
-    Ok(Conformed { image: Volume::new(data, new_affine), centroid, fwhm, canonical_affine })
+    let canonical_affine =
+        if ornt == Orientation::RAS { scan.affine } else { ornt.reoriented_affine(&scan.affine, scan.shape) };
+    // `nib.Nifti1Image(img.get_fdata(dtype=np.float32), img.affine)` gives float32 zooms from the
+    // affine
+    let voxel_sizes = canonical_affine.header_zooms();
+    let mask_ras = ornt.apply(mask.data.view());
+    let n_z = mask_ras.shape()[2];
+    let centroid = grid_centroid(mask_ras, voxel_sizes, n_z, config)?;
+    let shape = config.fov.map(|w| (w / config.min_voxel_size).ceil() as usize);
+    let affine = rescale_affine(&canonical_affine, [config.min_voxel_size; 3], shape, centroid);
+    Ok(GridPlacement { ornt, canonical_affine, centroid, shape, affine })
 }
 
 /// The scan as float32, reoriented to RAS+, in C order, with the zooms of a fresh header.

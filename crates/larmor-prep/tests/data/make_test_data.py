@@ -9,6 +9,11 @@ Each case is a synthetic head phantom (a NIfTI with an awkward geometry) run thr
 the fit-grid mask of `prepare_images`, `truncate_image`, the normalisation of
 `ViTMAE3D.dense_embed`, the patch coordinates, and a nearest-neighbour map of a label volume back
 to native space. Everything lands in `pipeline.safetensors` plus `pipeline.json`.
+
+The `pair` case is a second modality of the last phantom ("T2-like" contrast, its affine off by
+2e-4 mm), run through `prepare_images({"ref": t1, "other": t2}, {}, reference="ref")` itself (with
+its grid shrunk to the same small field of view), as FOMO tasks 1 and 2 prepare ADC and DWI on the
+FLAIR's head mask. Its tensors live in `pair.safetensors` plus `pair.json`.
 """
 
 import gzip
@@ -143,6 +148,61 @@ def run_case(name, t, cases, raw: bytes):
           f"{int(fit_mask.sum())} grid voxels in mask, {cases[name]['tokens']} tokens")
 
 
+def dense_embed_inputs(quantized: np.ndarray, fit_mask: np.ndarray, shape):
+    """ViTMAE3D.dense_embed's normalised image and in-mask patch coordinates, step for step."""
+    images = torch.from_numpy(quantized.astype(np.float32))[None]
+    image_mask = torch.from_numpy(fit_mask)
+    vals = images[0][image_mask]
+    vals = vals / vals.max()
+    vals = (vals - vals.mean()) / vals.std(correction=0).clamp_min(1e-6)
+    image = torch.zeros_like(images[0])
+    image[image_mask] = vals
+    in_mask = nbm.patchify3d(image_mask[None], PATCH).any(dim=2)[0]
+    coords = nbm.make_coord_grid(shape, PATCH)[0, in_mask]
+    return image.numpy(), coords.numpy().astype(np.int64)
+
+
+def run_pair_case(name, t, cases, reference_raw: bytes, target_raw: bytes):
+    """prepare_images with a reference modality: the target's tensors on the reference's mask."""
+    reference = nib.Nifti1Image.from_bytes(reference_raw)
+    target = nib.Nifti1Image.from_bytes(target_raw)
+    grid_fov = prepare.GRID_FOV
+    prepare.GRID_FOV = FOV  # prepare_images reads the global when it runs
+    try:
+        encoded = prepare.prepare_images({"ref": reference, "other": target}, {}, reference="ref")
+        alone = prepare.prepare_images({"image": target}, {}, reference="image")
+    finally:
+        prepare.GRID_FOV = grid_fov
+    fit_mask_img = prepare.decode_nifti_zst(encoded["mask"])
+    quant_img = prepare.decode_nifti_zst(encoded["other"])
+    fit_mask = np.asarray(fit_mask_img.dataobj) > 0
+    quantized = np.asarray(quant_img.dataobj)
+    # the reference's own mask, which is the one every modality is masked with
+    head_mask = np.asarray(preproc.threshold_mask(reference).dataobj)
+    image, coords = dense_embed_inputs(quantized, fit_mask, quant_img.shape)
+    alone_quantized = np.asarray(prepare.decode_nifti_zst(alone["image"]).dataobj)
+    assert not np.array_equal(alone_quantized, quantized), "the reference mask should change the target"
+
+    t[f"{name}/reference"] = np.frombuffer(gzip.compress(reference_raw, mtime=0), dtype=np.uint8)
+    t[f"{name}/scan"] = np.frombuffer(gzip.compress(target_raw, mtime=0), dtype=np.uint8)
+    t[f"{name}/head_mask"] = head_mask
+    t[f"{name}/fit_mask"] = fit_mask
+    t[f"{name}/fit_affine"] = fit_mask_img.affine
+    t[f"{name}/image_affine"] = quant_img.affine
+    t[f"{name}/quantized"] = quantized
+    t[f"{name}/image"] = image
+    t[f"{name}/coords"] = coords
+    cases[name] = {
+        "fov": list(FOV),
+        "patch": PATCH,
+        "tokens": int(len(coords)),
+        "target_alone_tokens": int(len(dense_embed_inputs(alone_quantized, np.asarray(
+            prepare.decode_nifti_zst(alone["mask"]).dataobj) > 0, quant_img.shape)[1])),
+    }
+    print(f"{name}: {int(fit_mask.sum())} grid voxels in the reference's mask, {len(coords)} tokens "
+          f"({cases[name]['target_alone_tokens']} on the target's own mask)")
+
+
 def main():
     t, cases = {}, {}
     # oblique LPS-ish, anisotropic with one axis finer than 1 mm (anti-aliased), int16 with scaling
@@ -175,6 +235,21 @@ def main():
     save_file(tensors, OUT / "pipeline.safetensors")
     (OUT / "pipeline.json").write_text(json.dumps(cases, indent=1, sort_keys=True) + "\n")
     print(f"pipeline.safetensors: {(OUT / 'pipeline.safetensors').stat().st_size / 1024:.0f} KiB")
+
+    # a second modality of the PIL phantom: dark tissue bright and the reverse, on an affine 2e-4 mm off
+    t, cases = {}, {}
+    rzs = np.array([[0.0, 0.0, -1.5], [-1.5, 0.0, 0.0], [0.0, -1.5, 0.0]])
+    affine = nib.affines.from_matvec(rzs, [17.0, 20.0, 16.0])
+    shape = (24, 22, 22)
+    t1 = phantom(shape, affine)
+    t2 = np.clip(1500.0 - t1, 0, None) * (t1 > 300) + rng.normal(0, 30, shape)
+    t2_affine = affine.copy()
+    t2_affine[:3, 3] += [2e-4, -1e-4, 0.0]
+    run_pair_case("pair", t, cases, nifti_bytes(t1, affine, np.float32), nifti_bytes(t2, t2_affine, np.float32))
+    tensors = {k: np.ascontiguousarray(v) for k, v in t.items()}
+    save_file(tensors, OUT / "pair.safetensors")
+    (OUT / "pair.json").write_text(json.dumps(cases, indent=1, sort_keys=True) + "\n")
+    print(f"pair.safetensors: {(OUT / 'pair.safetensors').stat().st_size / 1024:.0f} KiB")
 
 
 if __name__ == "__main__":

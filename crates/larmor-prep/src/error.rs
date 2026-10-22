@@ -64,6 +64,9 @@ pub enum PrepError {
         /// The scan's shape.
         scan: [usize; 3],
     },
+    /// A reference scan (for its head mask and grid) is not on the scan's voxel grid.
+    #[error("cannot use the reference scan's head mask: {0}")]
+    ReferenceGrid(String),
     /// A volume passed back to native space does not have the grid's shape.
     #[error("expected a volume of shape {expected:?} on the model grid, got {got:?}")]
     GridShape {

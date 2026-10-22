@@ -2,10 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use larmor_volume::{Affine, Interpolation, Nifti, Voxel, resample_from_to};
+use larmor_volume::{Affine, Interpolation, Nifti, Volume, Voxel, io_orientation, resample_from_to};
 use ndarray::{Array3, ArrayView3};
 
-use crate::conform::conform_image;
+use crate::conform::{conform_image, place_grid};
 use crate::error::PrepError;
 use crate::mask::threshold_mask;
 use crate::normalize::max_zscore;
@@ -46,10 +46,16 @@ pub struct Prepared {
     pub conformed: Array3<f32>,
     /// Head mask on the grid (step 5).
     pub mask: Array3<bool>,
-    /// Head mask on the scan's own voxel grid (step 1).
+    /// Head mask on the scan's own voxel grid (step 1); with a reference scan, the reference's
+    /// mask (the two share a voxel grid).
     pub native_mask: Array3<bool>,
-    /// Affine of the grid.
+    /// Affine of the grid: of `mask` and of labels mapped onto it (the reference's grid when there
+    /// is one, as `prepare_images` stores it).
     pub fit_affine: Affine,
+    /// Affine the image was conformed on. Equal to `fit_affine` for a scan on its own; with a
+    /// reference scan it is the target's own placement, which `prepare_images` requires to agree
+    /// with the reference's to 1e-3.
+    pub image_affine: Affine,
     /// Affine of the scan.
     pub native_affine: Affine,
     /// Shape of the scan.
@@ -68,6 +74,11 @@ pub struct Prepared {
     pub timings: Timings,
 }
 
+/// Absolute tolerance `prepare_images` allows between a modality's conformed grid and the
+/// reference's (`np.allclose(fit_img.affine, affine, atol=1e-3)`, numpy's default `rtol=1e-5`).
+const GRID_ATOL: f64 = 1e-3;
+const GRID_RTOL: f64 = 1e-5;
+
 impl Recipe {
     /// Preprocesses one scan.
     ///
@@ -76,21 +87,74 @@ impl Recipe {
     /// `ViTMAE3D.dense_embed`.
     pub fn run(&self, nifti: &Nifti) -> Result<Prepared, PrepError> {
         self.validate()?;
-        let scan = Scan::of(nifti)?;
-        let mut timings = Timings::default();
-
         let start = Instant::now();
         let native_mask = threshold_mask(nifti, &self.mask)?;
-        timings.mask = start.elapsed();
+        let mask_time = start.elapsed();
+        self.finish(nifti, nifti, native_mask, mask_time)
+    }
+
+    /// Preprocesses `target` on the head mask and grid of `reference`, another modality of the same
+    /// subject on the same voxel grid.
+    ///
+    /// Mirrors `eval/prepare.py::prepare_images({..., "ref": reference, "other": target}, segs,
+    /// reference="ref")` for the target: the head mask comes from the reference alone, the target
+    /// is conformed with that mask, its grid must agree with the reference's to 1e-3 (the
+    /// function's assertion), and it is quantized and normalised inside the reference's grid mask.
+    /// The eval framework prepares FOMO tasks 1 and 2 this way (ADC and DWI on the FLAIR's mask).
+    ///
+    /// `run_with_reference(x, x)` equals `run(x)`. A target on a different voxel grid (shape,
+    /// orientation, or an affine whose grid lands elsewhere) is an error.
+    pub fn run_with_reference(&self, target: &Nifti, reference: &Nifti) -> Result<Prepared, PrepError> {
+        self.validate()?;
+        let (target_scan, reference_scan) = (Scan::of(target)?, Scan::of(reference)?);
+        if target_scan.shape != reference_scan.shape {
+            return Err(PrepError::ReferenceGrid(format!(
+                "the scan is {:?} voxels but the reference is {:?}",
+                target_scan.shape, reference_scan.shape
+            )));
+        }
+        let (target_ornt, reference_ornt) =
+            (io_orientation(&target_scan.affine)?, io_orientation(&reference_scan.affine)?);
+        if target_ornt != reference_ornt {
+            return Err(PrepError::ReferenceGrid(
+                "the scan and the reference store their voxel axes in different orientations".into(),
+            ));
+        }
+        let start = Instant::now();
+        let native_mask = threshold_mask(reference, &self.mask)?;
+        let mask_time = start.elapsed();
+        self.finish(target, reference, native_mask, mask_time)
+    }
+
+    /// Steps 2–7 of `target` with the head mask `native_mask` of `reference` (the same image for
+    /// a scan on its own).
+    fn finish(
+        &self,
+        target: &Nifti,
+        reference: &Nifti,
+        native_mask: Volume<u8>,
+        mask_time: std::time::Duration,
+    ) -> Result<Prepared, PrepError> {
+        let scan = Scan::of(target)?;
+        let mut timings = Timings { mask: mask_time, ..Timings::default() };
 
         let start = Instant::now();
-        let conformed = conform_image(nifti, &native_mask, &self.conform)?;
-        let fit_affine = conformed.image.affine;
+        let conformed = conform_image(target, &native_mask, &self.conform)?;
+        let image_affine = conformed.image.affine;
         let grid = conformed.image.shape();
+        let (mask_affine, fit_affine) = if std::ptr::eq(target, reference) {
+            (scan.affine, image_affine)
+        } else {
+            // prepare_images: the grid is the reference's conform_image placement
+            let reference_scan = Scan::of(reference)?;
+            let placement = place_grid(&reference_scan, &native_mask, &self.conform)?;
+            check_grid_agrees(&image_affine, &placement.affine)?;
+            (reference_scan.affine, placement.affine)
+        };
         // prepare_images: resample_from_to(mask_img, reference_img, order=0) > 0
         let mask = resample_from_to(
             native_mask.data.view(),
-            &scan.affine,
+            &mask_affine,
             grid,
             &fit_affine,
             Interpolation::Nearest,
@@ -117,6 +181,7 @@ impl Recipe {
             mask,
             native_mask,
             fit_affine,
+            image_affine,
             native_affine: scan.affine,
             native_shape: scan.shape,
             centroid: conformed.centroid,
@@ -126,6 +191,27 @@ impl Recipe {
             mask_volume_ml,
             timings,
         })
+    }
+}
+
+/// `prepare_images`' `assert np.allclose(fit_img.affine, affine, atol=1e-3)`, as an error.
+fn check_grid_agrees(image_affine: &Affine, reference_affine: &Affine) -> Result<(), PrepError> {
+    let worst = image_affine
+        .0
+        .iter()
+        .flatten()
+        .zip(reference_affine.0.iter().flatten())
+        .map(|(a, b)| (a - b).abs() - (GRID_ATOL + GRID_RTOL * b.abs()))
+        .fold(f64::NEG_INFINITY, f64::max);
+    // NaN (a comparison numpy's allclose also fails) counts as a disagreement
+    if worst <= 0.0 {
+        Ok(())
+    } else {
+        Err(PrepError::ReferenceGrid(format!(
+            "conformed on the reference's head mask, the scan's grid lands {:.3} mm (or more) away from \
+             the reference's; the two are not on the same voxel grid",
+            worst + GRID_ATOL
+        )))
     }
 }
 

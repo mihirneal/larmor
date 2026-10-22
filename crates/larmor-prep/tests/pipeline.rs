@@ -112,3 +112,92 @@ fn to_native_rejects_volumes_off_the_grid() {
     assert!(prepared.tokens(5).is_err());
     assert!(prepared.mask_volume_ml > 0.0);
 }
+
+/// The `pair` case: a second modality prepared on the reference's head mask and grid, against
+/// `prepare_images({"ref": t1, "other": t2}, {}, reference="ref")` itself.
+#[test]
+fn a_second_modality_on_the_reference_mask_matches_prepare_images() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let bytes = std::fs::read(dir.join("pair.safetensors")).unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    let cases: serde_json::Map<String, Value> =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("pair.json")).unwrap()).unwrap();
+    let case = Case { name: "pair".into(), params: cases["pair"].clone(), tensors: &tensors };
+    let reference = Nifti::from_bytes(case.raw("reference", Dtype::U8).0).unwrap();
+    let target = Nifti::from_bytes(case.raw("scan", Dtype::U8).0).unwrap();
+    let mut recipe = Recipe::nanobrain_eval();
+    recipe.conform.fov = [24.0, 32.0, 24.0];
+
+    let p = recipe.run_with_reference(&target, &reference).unwrap();
+    assert_eq!(p.native_mask, case.array("head_mask", Dtype::U8, |c| c[0] > 0), "reference head mask");
+    assert_eq!(p.mask, case.array("fit_mask", Dtype::BOOL, |c| c[0] != 0), "fit mask");
+    let flat = |a: larmor_volume::Affine| a.0.iter().flatten().copied().collect::<Vec<f64>>();
+    assert_eq!(flat(p.fit_affine), case.f64s("fit_affine"), "the grid is the reference's");
+    assert_eq!(flat(p.image_affine), case.f64s("image_affine"), "the target's own placement");
+    assert_ne!(p.fit_affine, p.image_affine, "the target's affine is 2e-4 mm off");
+    let quantized = case.array("quantized", Dtype::U16, |c| u16::from_le_bytes(c.try_into().unwrap()));
+    assert_eq!(p.quantized, quantized, "quantized");
+    let image = case.array("image", Dtype::F32, f32_le);
+    let max_diff = p.image.iter().zip(image.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_diff <= 1e-6, "normalized image differs by {max_diff}");
+    let coords: Vec<[u16; 3]> =
+        case.i64s("coords").chunks(3).map(|c| [c[0] as u16, c[1] as u16, c[2] as u16]).collect();
+    assert_eq!(p.tokens(4).unwrap().coords, coords, "token coordinates");
+
+    // on its own, the target gets its own mask and other tokens
+    let alone = recipe.run(&target).unwrap();
+    assert_eq!(alone.tokens(4).unwrap().len() as u64, case.params["target_alone_tokens"].as_u64().unwrap());
+    assert_ne!(alone.mask, p.mask);
+
+    // a scan as its own reference is the scan on its own
+    let same = recipe.run_with_reference(&reference, &reference.clone()).unwrap();
+    let plain = recipe.run(&reference).unwrap();
+    assert_eq!((same.quantized, same.mask, same.fit_affine), (plain.quantized, plain.mask, plain.fit_affine));
+}
+
+#[test]
+fn a_reference_on_another_voxel_grid_is_refused() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let bytes = std::fs::read(dir.join("pair.safetensors")).unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    let reference = Nifti::from_bytes(tensors.tensor("pair/reference").unwrap().data()).unwrap();
+    let target = Nifti::from_bytes(tensors.tensor("pair/scan").unwrap().data()).unwrap();
+    let mut recipe = Recipe::nanobrain_eval();
+    recipe.conform.fov = [24.0, 32.0, 24.0];
+    let refused = |target: &Nifti| {
+        let err = recipe.run_with_reference(target, &reference).unwrap_err().to_string();
+        assert!(err.contains("reference"), "{err}");
+        err
+    };
+
+    // shifted by 0.01 mm: prepare_images' np.allclose(atol=1e-3) assertion fails
+    let mut shifted = target.clone();
+    shifted.header.srow_x[3] += 0.01;
+    assert!(refused(&shifted).contains("same voxel grid"));
+
+    // another shape
+    let pil = Nifti::from_bytes(
+        &std::fs::read(dir.join("pipeline.safetensors"))
+            .map(|b| {
+                SafeTensors::deserialize(&b)
+                    .unwrap()
+                    .tensor("oblique_scaled_int16/scan")
+                    .unwrap()
+                    .data()
+                    .to_vec()
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(refused(&pil).contains("voxels"));
+
+    // the same world grid with its last two voxel axes stored the other way round (same shape)
+    let data = target.data.to_f32().permuted_axes(IxDyn(&[0, 2, 1])).as_standard_layout().into_owned();
+    let mut affine = target.affine().unwrap();
+    for row in &mut affine.0 {
+        row.swap(1, 2);
+    }
+    let swapped = Nifti::new(larmor_volume::VoxelData::F32(data), &affine);
+    assert_eq!(swapped.shape(), target.shape());
+    assert!(refused(&swapped).contains("orientations"));
+}
