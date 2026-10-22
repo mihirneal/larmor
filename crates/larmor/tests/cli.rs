@@ -58,8 +58,9 @@ fn encode_writes_bids_outputs_and_reuses_the_cache() {
             "sub-02/ses-1/anat/sub-02_ses-1_T1w_model-tiny_run.json",
         ]
     );
-    // a scan outside any BIDS dataset goes to ./derivatives/larmor/<stem>/
-    let loose = ws.path("derivatives/larmor/brain");
+    // a scan outside any BIDS dataset goes to ./derivatives/larmor/, in its folder below the
+    // inputs' common folder (here the workspace: ds and loose/brain.nii)
+    let loose = ws.path("derivatives/larmor/loose");
     assert!(loose.join("brain_model-tiny_embedding.npy").is_file());
     assert!(ws.path("derivatives/larmor/dataset_description.json").is_file());
 
@@ -106,7 +107,13 @@ fn encode_writes_bids_outputs_and_reuses_the_cache() {
     assert!(run["started"].as_str().unwrap().len() >= 19 && run["finished"].is_string());
     assert_eq!(run["cache"]["hit"], false);
     let cache_path = run["cache"]["path"].as_str().unwrap();
-    let expected = ws.cache().join(format!("tiny-{}", &sha[..8])).join(&prep_version[..8]);
+    // the cache folder is named after the encoder key (weights, architecture, readout), then the
+    // preprocessing version and the precision
+    let encoder_key = run["model"]["encoder_key"].as_str().unwrap();
+    let manifest = larmor_model::Manifest::load(ws.path("models/tiny.toml")).unwrap();
+    assert_eq!(encoder_key, manifest.encoder_key());
+    let expected =
+        ws.cache().join(format!("tiny-{}", &encoder_key[..8])).join(&prep_version[..8]).join("f32");
     assert!(Path::new(cache_path).starts_with(&expected), "{cache_path}");
     assert!(Path::new(cache_path).is_file());
 

@@ -75,6 +75,37 @@ slightly and is not the target.
 9. **Readout**: encoder output after the final LayerNorm, class tokens dropped. Pooled = mean of the in-mask
    tokens.
 
+**Inputs.** Single-file NIfTI-1 and NIfTI-2 (`.nii`, `.nii.gz`), read with nibabel's header fixes; integer
+and real float data. A NIfTI-2 scan goes through the recipe exactly as nibabel takes it: its float64 zooms
+are rounded to float32 where nanobrain's resampling turns it into a `Nifti1Image`. Two-file images,
+Analyze headers and complex or RGB data are refused (convert them; for complex data, to a magnitude
+image). A file is read header first, and only the voxel bytes the header describes are decompressed. A
+header whose sizes overflow, or geometry so corrupt that a smoothing kernel or the 2 mm mask grid would be
+absurd (voxel sizes like 1e-30 or 1e30 mm), is an error for that scan (where nibabel and scipy fail too).
+
+### Multi-modal: a reference scan's head mask
+
+`prepare_images(images, segs, reference=...)` prepares every modality of a subject on one head mask, the
+reference's: `threshold_mask` runs on the reference, each modality is conformed with that native mask
+(steps 2–4 on the modality's own data, so its grid placement uses the reference's mask), the grids must
+agree (`np.allclose(fit_img.affine, affine, atol=1e-3)`), and steps 5–6 use the reference's fit-grid mask
+(`resample_from_to(mask, reference_img, order=0)`); `dense_embed` then normalises inside that mask. The
+fit affine of the mask and of segmentation labels is the reference's. FOMO tasks 1 and 2 prepare ADC and
+DWI this way on the FLAIR. `Recipe::run_with_reference(target, reference)` mirrors it (`larmor encode
+--reference`, a `reference` column in `labels.tsv`) and refuses a target on another voxel grid (shape,
+orientation, or a grid more than 1e-3 off); `run_with_reference(x, x)` equals `run(x)`.
+
+Which of nanobrain's `DEFAULT_TASKS` Larmor reproduces:
+
+| Task | Input | Larmor |
+|---|---|---|
+| `fomo_task1_adc_lesion` | ADC on the FLAIR's mask | yes, with the FLAIR as reference |
+| `fomo_task2_dwi_tumor` | DWI b1000 on the FLAIR's mask | yes, with the FLAIR as reference |
+| `fomo_task3_t1w_age`, `fomo_task3_t1w_hippocampus` | T1w | yes |
+| `fomo_task4_t2w_nerve`, `fomo_task4_t2w_vessel` | T2w | yes |
+| `fomo_task5_t1w_cortex` | T1w (labels from SynthSeg, `select_labels`) | yes |
+| `fomo_task5_t1w_pmg` | T1w and mask multiplied by the SynthSeg brain mask and a 133 mm AP window (`strip_and_crop_ap`) before `dense_embed` | no: needs SynthSeg and that transform |
+
 ## Model manifest (`model.toml`)
 
 ```toml
@@ -147,7 +178,14 @@ git_sha = "fe34e0d"
 A new model family is a new manifest, not new code, as long as its architecture and preprocessing use
 supported values. The **preprocessing version** in cache keys is the SHA-256 of the canonical JSON of
 `preprocessing.steps` plus `larmor_prep::IMPL_VERSION` (bumped whenever a numeric change could move
-outputs).
+outputs). The **encoder key** (`Manifest::encoder_key`) is the SHA-256 of the canonical JSON of `family`,
+`[architecture]`, `[readout]`, the weights' `sha256` and `naming`, and `larmor_model::ENCODER_IMPL_VERSION`
+(bumped whenever a numeric change to the encoder could move outputs): `heads` and `norm_eps` change the
+embeddings without changing any weight shape, so the weights' checksum alone does not identify them.
+
+`id` is 1 to 64 letters, digits, `.`, `_` or `-`, starting with a letter or digit, without `..` (it
+becomes part of cache folders and output names); `weights.file` is a plain file name in the manifest's
+folder.
 
 ## Reference fixtures (`fixtures/`, never committed)
 
@@ -189,15 +227,18 @@ checkpoints export with `tools/export_checkpoint.py` where they live (the cluste
 
 ## Embedding cache
 
-Key = `sha256(scan file bytes)` + preprocessing version + model weights sha256. Location
-`$LARMOR_CACHE` or `~/Library/Caches/larmor` (`$XDG_CACHE_HOME/larmor` on Linux):
+Key = `sha256(scan file bytes)` + the reference scan's sha256 (multi-modal) + preprocessing version + encoder
+key + precision (`f32`, `f16`, `bf16`). Location `$LARMOR_CACHE` or `~/Library/Caches/larmor`
+(`$XDG_CACHE_HOME/larmor` on Linux):
 
 ```
-<cache>/<model_id>-<model_sha8>/<prep_version8>/<scan_sha256>.safetensors
-    tokens f16 [N, D], coords u16 [N, 3], pooled f32 [D]; metadata: run.json fields
+<cache>/<model_id>-<encoder_key8>/<prep_version8>/<precision>/<scan_sha256>[_ref-<reference_sha256>].safetensors
+    tokens f16 [N, D], coords u16 [N, 3], pooled f32 [D]; metadata: the key and the run.json fields
 ```
 
-Changing any of the three invalidates the entry (a different path).
+Changing any part invalidates the entry (a different path); a read also checks the key recorded in the
+metadata. A fresh encode hands the probes its tokens rounded to f16, as a cache hit does, so results never
+depend on whether a scan was cached.
 
 ## CLI
 
@@ -228,9 +269,17 @@ in the scan's native space.
 Folds and bootstrap resamples reproduce numpy's generators (legacy `RandomState` for sklearn folds,
 `default_rng` for bootstraps), so the numbers match without a `fold` column.
 
-Probe file: `probe.toml` (model id and sha256, preprocessing version, layer, pooling, kind, label names,
-CV metrics, sha256 of the training label table) plus `probe.safetensors`. `probe apply` refuses a probe
-whose model sha256 or preprocessing version doesn't match.
+Probe file: `probe.toml` (model id and sha256, encoder key, embedding precision, preprocessing version,
+layer, pooling, kind, label names, CV metrics, sha256 of the training label table) plus `probe.safetensors`,
+each written atomically. `probe apply` refuses a probe whose model sha256, encoder key or preprocessing
+version doesn't match.
+
+Where the eval framework fails, `probe fit` fails too instead of reporting numbers it cannot produce: a
+class with fewer than 5 samples in an outer training fold (sklearn's `LogisticRegressionCV` raises), NaN
+or infinite embeddings (sklearn raises), a segmentation training set that `max_negative_ratio` leaves
+empty (torch raises), fewer than 5 samples for the outer 5-fold CV. Solvers treat a NaN gradient as an
+error, never as convergence. A `labels.tsv` naming one scan twice is refused, since copies in different
+folds leak between training and test.
 
 ## Gates
 

@@ -1,5 +1,6 @@
 //! `larmor probe fit` and `larmor probe apply`.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -13,19 +14,19 @@ use larmor_probe::fit::{
 };
 use larmor_probe::logistic::LogisticCvOptions;
 use larmor_probe::probe_file::{EmbeddingSource, Probe, ProbeKind};
-use larmor_probe::segmentation::{SegmentationOptions, SubjectPatches};
+use larmor_probe::segmentation::{SegmentationOptions, SolverStop, SubjectPatches};
 use larmor_volume::{Affine, Nifti, VoxelData};
 
-use crate::cache::{self, CacheEntry};
-use crate::console::{bold, dim, green, secs, with_ci, yellow};
+use crate::cache::CacheEntry;
+use crate::console::{bold, dim, green, red, secs, with_ci, yellow};
 use crate::device;
-use crate::encode_cmd::prepare_again;
-use crate::hashing::sha256_hex;
-use crate::labels::{LabelColumn, LabelTable};
+use crate::encode_cmd::{check_reference, prepare_again};
+use crate::hashing::sha256_file;
+use crate::labels::{LabelColumn, LabelRow, LabelTable};
 use crate::locate;
 use crate::model::Model;
-use crate::outputs::{self, ScanOutputs, tsv_cell};
-use crate::pipeline::{Pipeline, ScanResult};
+use crate::outputs::{self, ScanOutputs, check_unique_outputs, tsv_cell};
+use crate::pipeline::{Pipeline, ScanResult, reference_key};
 use crate::seg_labels::{assemble_patches, labels_on_grid, patch_rows};
 
 /// `--kind`.
@@ -57,23 +58,23 @@ pub fn cmd_probe_fit(options: FitOptions) -> Result<()> {
         println!("{} {} rows have no {} and are left out", dim("note:"), column.skipped, column.name);
     }
     let model = Model::resolve(&options.model)?;
+    let mut pipeline = Pipeline::new(&model, options.device, options.precision, locate::cache_root()?);
     println!(
-        "{}  {:?} probe on {} · {} scans · model {} ({})",
+        "{}  {:?} probe on {} · {} scans · model {} ({}) · {}",
         bold("larmor probe fit"),
         options.kind,
         column.name,
         column.rows.len(),
         bold(model.id()),
-        &model.weights_sha256()[..8]
+        &model.encoder_key[..8],
+        pipeline.precision()
     );
 
-    let scans: Vec<PathBuf> = column.rows.iter().map(|row| row.scan.clone()).collect();
     let with_tokens = options.kind == Kind::Segmentation;
-    let entries = cached_entries(&model, &scans, &options, with_tokens)?;
+    let entries = cached_entries(&mut pipeline, &table, &column, options.encode, with_tokens)?;
 
     let fit_start = Instant::now();
-    let precision = options.precision.to_string();
-    let fit = FitInput { column: &column, table: &table, model: &model, precision };
+    let fit = FitInput { column: &column, table: &table, model: &model, precision: pipeline.precision() };
     let mut probe = match options.kind {
         Kind::Regression => fit_regression(&fit, &entries)?,
         Kind::Classification => fit_classification(&fit, &entries)?,
@@ -101,8 +102,7 @@ struct FitInput<'a> {
     column: &'a LabelColumn<'a>,
     table: &'a LabelTable,
     model: &'a Model,
-    /// The precision asked for with `--precision`.
-    precision: String,
+    precision: Precision,
 }
 
 impl FitInput<'_> {
@@ -111,8 +111,8 @@ impl FitInput<'_> {
         Provenance {
             model_id: self.model.id().to_string(),
             model_sha256: self.model.weights_sha256(),
-            encoder_key: self.model.manifest.encoder_key(),
-            precision: self.precision.clone(),
+            encoder_key: self.model.encoder_key.clone(),
+            precision: self.precision.to_string(),
             preprocessing_version: self.model.prep_version.clone(),
             layer: "last".into(),
             label_names,
@@ -178,6 +178,14 @@ fn fit_segmentation(fit: &FitInput, entries: Vec<CacheEntry>, options: &FitOptio
     );
     let choices = format!("outer folds chose alpha {:?}, threshold {:?}", r.fold_alpha, r.fold_threshold);
     println!("  {}", dim(&choices));
+    let max_iter = cv.stops.iter().filter(|&&s| s == SolverStop::MaxIter).count();
+    if max_iter > 0 {
+        println!(
+            "  {} {max_iter} of {} segmentation fits reached the iteration limit before the gradient tolerance",
+            yellow("warning:"),
+            cv.stops.len()
+        );
+    }
     Ok(probe)
 }
 
@@ -197,50 +205,174 @@ fn chosen(probe: &Probe) -> String {
     parts.join(", ")
 }
 
-/// The cache entries of `scans`, encoding missing ones with `--encode`, else an error listing them.
+/// A label row's scan and reference, hashed.
+struct RowKey {
+    scan_sha256: String,
+    reference_sha256: Option<String>,
+}
+
+impl RowKey {
+    /// The reference as the cache key sees it (none when the scan is its own reference).
+    fn reference(&self) -> Option<&str> {
+        reference_key(&self.scan_sha256, self.reference_sha256.as_deref())
+    }
+}
+
+/// The cache entries of the column's scans, encoding missing (or unreadable) ones with `--encode`,
+/// else an error listing them.
 fn cached_entries(
-    model: &Model,
-    scans: &[PathBuf],
-    options: &FitOptions,
+    pipeline: &mut Pipeline,
+    table: &LabelTable,
+    column: &LabelColumn,
+    encode: bool,
     with_tokens: bool,
 ) -> Result<Vec<CacheEntry>> {
-    let cache_root = locate::cache_root()?;
-    let mut paths = Vec::with_capacity(scans.len());
-    for scan in scans {
-        let bytes = std::fs::read(scan).with_context(|| format!("reading {}", scan.display()))?;
-        paths.push(cache::entry_path(&cache_root, model, &sha256_hex(&bytes)));
+    let model = pipeline.model();
+    let mut keys = Vec::with_capacity(column.rows.len());
+    for row in &column.rows {
+        let hash = |path: &Path| sha256_file(path).with_context(|| format!("reading {}", path.display()));
+        let reference_sha256 = row.reference.as_deref().map(hash).transpose()?;
+        keys.push(RowKey { scan_sha256: hash(&row.scan)?, reference_sha256 });
     }
-    let missing: Vec<&PathBuf> =
-        scans.iter().zip(&paths).filter(|(_, p)| !p.is_file()).map(|(s, _)| s).collect();
-    if !missing.is_empty() && !options.encode {
-        let list: Vec<String> = missing.iter().take(20).map(|p| format!("  {}", p.display())).collect();
+    check_duplicates(&table.path, &column.rows, &keys, column.folds.as_deref())?;
+
+    let mut entries: Vec<Option<CacheEntry>> = Vec::with_capacity(keys.len());
+    // rows (by index) without a usable entry, with the problem of an unreadable one
+    let mut missing: Vec<(usize, Option<String>)> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        match pipeline.stager.lookup(&key.scan_sha256, key.reference(), with_tokens) {
+            Ok(Some(entry)) => entries.push(Some(entry)),
+            Ok(None) => {
+                missing.push((i, None));
+                entries.push(None);
+            }
+            Err(err) => {
+                missing.push((i, Some(format!("{err:#}"))));
+                entries.push(None);
+            }
+        }
+    }
+    if !missing.is_empty() && !encode {
+        let list: Vec<String> = missing
+            .iter()
+            .take(20)
+            .map(|(i, problem)| {
+                let scan = column.rows[*i].scan.display();
+                match problem {
+                    None => format!("  {scan}"),
+                    Some(problem) => format!("  {scan} (unreadable cache entry: {problem})"),
+                }
+            })
+            .collect();
         let more = if missing.len() > 20 {
             format!("\n  … and {} more", missing.len() - 20)
         } else {
             String::new()
         };
+        let other_precisions = other_precision_hint(pipeline, &missing, &keys);
         bail!(
-            "{} of {} scans are not encoded with {} yet:\n{}{more}\nRun `larmor encode <scans or folder> --model {}` first, or pass --encode.",
+            "{} of {} scans are not encoded with {} in {} yet:\n{}{more}\nRun `larmor encode <scans or folder> \
+             --model {}` first (with --force for unreadable entries), or pass --encode.{other_precisions}",
             missing.len(),
-            scans.len(),
+            column.rows.len(),
             model.id(),
+            pipeline.precision(),
             list.join("\n"),
             model.id()
         );
     }
-    let mut pipeline = Pipeline::new(model, options.device, options.precision, cache_root);
-    let mut entries = Vec::with_capacity(scans.len());
-    for (scan, path) in scans.iter().zip(&paths) {
-        let entry = if path.is_file() {
-            CacheEntry::read(path, with_tokens)?
-        } else {
-            let entry = pipeline.run(scan, with_tokens)?.entry;
-            println!("  {} {}  {} tokens", green("encoded"), locate::scan_stem(scan), entry.info.tokens);
-            entry
+    let mut out = Vec::with_capacity(entries.len());
+    for (row, entry) in column.rows.iter().zip(entries) {
+        let entry = match entry {
+            Some(entry) => entry,
+            // re-encodes an unreadable entry too
+            None => {
+                let entry = pipeline.run(&row.scan, row.reference.as_deref(), with_tokens)?.entry;
+                println!(
+                    "  {} {}  {} tokens",
+                    green("encoded"),
+                    locate::scan_stem(&row.scan),
+                    entry.info.tokens
+                );
+                entry
+            }
         };
-        entries.push(entry);
+        out.push(entry);
     }
-    Ok(entries)
+    Ok(out)
+}
+
+/// A hint when the missing scans are cached in another precision.
+fn other_precision_hint(pipeline: &Pipeline, missing: &[(usize, Option<String>)], keys: &[RowKey]) -> String {
+    for precision in [Precision::F32, Precision::F16, Precision::Bf16] {
+        if precision == pipeline.precision() {
+            continue;
+        }
+        let stager = pipeline.stager.with_precision(precision);
+        let found = missing
+            .iter()
+            .filter(|(i, _)| stager.entry_path(&keys[*i].scan_sha256, keys[*i].reference()).is_file())
+            .count();
+        if found > 0 {
+            return format!(
+                "\n{found} of them are cached in {precision}; pass --precision {precision} to fit on those."
+            );
+        }
+    }
+    String::new()
+}
+
+/// Refuses a table that names the same scan (the same file, or files with the same bytes) on more
+/// than one row: without a fold column, cross-validation could put copies on both sides of a split
+/// and report leaked, inflated metrics. Copies that a `fold` column keeps in one fold are allowed.
+fn check_duplicates(
+    table: &Path,
+    rows: &[&LabelRow],
+    keys: &[RowKey],
+    folds: Option<&[usize]>,
+) -> Result<()> {
+    let mut groups: HashMap<(&str, Option<&str>), Vec<usize>> = HashMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        groups.entry((key.scan_sha256.as_str(), key.reference())).or_default().push(i);
+    }
+    let mut duplicates: Vec<Vec<usize>> = groups.into_values().filter(|g| g.len() > 1).collect();
+    duplicates.sort();
+    let mut problems = Vec::new();
+    let mut allowed = 0;
+    for group in &duplicates {
+        if let Some(folds) = folds
+            && group.iter().all(|&i| folds[i] == folds[group[0]])
+        {
+            allowed += group.len() - 1;
+            continue;
+        }
+        let lines: Vec<String> = group.iter().map(|&i| rows[i].line.to_string()).collect();
+        let canonical = |i: usize| std::fs::canonicalize(&rows[i].scan).ok();
+        let same_file = group.iter().all(|&i| canonical(i) == canonical(group[0]));
+        let what = if same_file {
+            format!("the same scan ({})", rows[group[0]].scan.display())
+        } else {
+            let names: Vec<String> = group.iter().map(|&i| rows[i].scan.display().to_string()).collect();
+            format!("files with identical bytes ({})", names.join(", "))
+        };
+        problems.push(format!("  lines {} name {what}", lines.join(", ")));
+    }
+    if allowed > 0 {
+        println!(
+            "{} {allowed} repeated scans are kept: the fold column puts every copy in one fold",
+            dim("note:")
+        );
+    }
+    if !problems.is_empty() {
+        bail!(
+            "{} names a scan more than once:\n{}\nCopies of a scan in different cross-validation folds leak between \
+             training and test and inflate the metrics. Remove the repeats, or keep each scan's copies in one fold \
+             with a `fold` column.",
+            table.display(),
+            problems.join("\n")
+        );
+    }
+    Ok(())
 }
 
 /// `[n_scans, D]` pooled embeddings.
@@ -256,17 +388,29 @@ fn segmentation_subjects(
     table: &Path,
 ) -> Result<Vec<SubjectPatches>> {
     let label_paths = column.paths(table);
-    entries
+    let (mut on_grid, mut in_patches) = (0usize, 0usize);
+    let subjects = entries
         .into_iter()
         .zip(&label_paths)
         .map(|(entry, path)| {
             let grid = &entry.info.grid;
             let labels = labels_on_grid(path, grid.shape, &Affine(grid.fit_affine))?;
+            on_grid += labels.iter().filter(|&&v| v > 0).count();
             let labels = patch_rows(&labels, &entry.coords, grid.patch);
+            in_patches += labels.data().iter().filter(|&&v| v > 0).count();
             let (rows, width) = (entry.coords.len(), entry.width());
             Ok(SubjectPatches { features: Matrix::new(rows, width, entry.tokens), labels })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    if on_grid > in_patches {
+        println!(
+            "{} {} of {on_grid} labelled voxels on the model grid lie outside the in-mask patches and are not \
+             used (as in the eval framework)",
+            dim("note:"),
+            on_grid - in_patches
+        );
+    }
+    Ok(subjects)
 }
 
 /// Options of `larmor probe apply`.
@@ -275,6 +419,8 @@ pub struct ApplyOptions {
     pub inputs: Vec<PathBuf>,
     pub out: Option<PathBuf>,
     pub model: Option<String>,
+    /// Prepare every scan on this scan's head mask and grid.
+    pub reference: Option<PathBuf>,
     pub device: DeviceChoice,
     pub precision: Precision,
 }
@@ -286,7 +432,7 @@ pub fn cmd_probe_apply(options: ApplyOptions) -> Result<()> {
     let model = Model::resolve(options.model.as_deref().unwrap_or(&meta.model_id))?;
     let source = EmbeddingSource {
         model_sha256: model.weights_sha256(),
-        encoder_key: model.manifest.encoder_key(),
+        encoder_key: model.encoder_key.clone(),
         preprocessing_version: model.prep_version.clone(),
         embed_dim: model.width(),
     };
@@ -298,29 +444,56 @@ pub fn cmd_probe_apply(options: ApplyOptions) -> Result<()> {
             model.path.display()
         )
     })?;
-    let scans = locate::find_scans(&options.inputs)?;
+    if let Some(reference) = &options.reference {
+        check_reference(reference)?;
+    }
+    let found = locate::find_scans(&options.inputs, options.out.as_slice())?;
+    let scans = found.scans;
     if scans.is_empty() {
         bail!("no .nii or .nii.gz scans found");
     }
     let name = probe_name(&options.probe, &probe);
+    let mut pipeline = Pipeline::new(&model, options.device, options.precision, locate::cache_root()?);
     println!(
-        "{}  {} ({:?}) · {} scan{} · model {}",
+        "{}  {} ({:?}) · {} scan{} · model {} · {}",
         bold("larmor probe apply"),
         name,
         meta.kind,
         scans.len(),
         if scans.len() == 1 { "" } else { "s" },
-        bold(model.id())
+        bold(model.id()),
+        pipeline.precision()
     );
-    let mut pipeline = Pipeline::new(&model, options.device, options.precision, locate::cache_root()?);
-    match meta.kind {
+    if let Some(trained) = &meta.precision
+        && *trained != pipeline.precision().to_string()
+    {
+        eprintln!(
+            "{} the probe was fit on {trained} embeddings; these are {} (pass --precision {trained} to match)",
+            yellow("warning:"),
+            pipeline.precision()
+        );
+    }
+    let scans = Scans { paths: &scans, root: found.root.as_deref(), reference: options.reference.as_deref() };
+    let failed = match meta.kind {
         ProbeKind::Regression | ProbeKind::Classification => {
-            apply_scan_level(&probe, &name, &scans, &mut pipeline, options.out.as_deref())
+            apply_scan_level(&probe, &name, &scans, &mut pipeline, options.out.as_deref())?
         }
         ProbeKind::Segmentation => {
-            apply_segmentation(&probe, &name, &scans, &mut pipeline, options.out.as_deref(), options.device)
+            apply_segmentation(&probe, &name, &scans, &mut pipeline, options.out.as_deref(), options.device)?
         }
+    };
+    if failed > 0 {
+        bail!("{failed} of {} scans failed", scans.paths.len());
     }
+    Ok(())
+}
+
+/// The scans `probe apply` predicts on.
+struct Scans<'a> {
+    paths: &'a [PathBuf],
+    /// The inputs' common folder, for output paths.
+    root: Option<&'a Path>,
+    reference: Option<&'a Path>,
 }
 
 /// The name used in output files: the probe file's stem, or its label column when the file is just
@@ -337,31 +510,46 @@ fn probe_name(path: &Path, probe: &Probe) -> String {
 }
 
 /// Regression values or class probabilities for every scan, printed and written to
-/// `<out>/<name>_predictions.tsv`.
+/// `<out>/<name>_predictions.tsv`. A scan that fails is reported and left out; returns how many
+/// failed.
 fn apply_scan_level(
     probe: &Probe,
     name: &str,
-    scans: &[PathBuf],
+    scans: &Scans,
     pipeline: &mut Pipeline,
     out: Option<&Path>,
-) -> Result<()> {
-    let mut pooled = Vec::with_capacity(scans.len());
-    for scan in scans {
-        pooled.push(pipeline.run(scan, false)?.entry.pooled);
-    }
-    let predictions = probe.predict_scans(&Matrix::from_rows(&pooled))?;
+) -> Result<usize> {
     // label_names = [column, negative class, positive class] for classification
     let classes = match (probe.metadata.kind, probe.metadata.label_names.as_slice()) {
         (ProbeKind::Classification, [_, negative, positive, ..]) => Some((negative, positive)),
         (ProbeKind::Classification, _) => bail!("the probe's label_names do not name its two classes"),
         _ => None,
     };
+    let mut done: Vec<&PathBuf> = Vec::with_capacity(scans.paths.len());
+    let mut pooled = Vec::with_capacity(scans.paths.len());
+    let mut failed = 0;
+    for scan in scans.paths {
+        match pipeline.run(scan, scans.reference, false) {
+            Ok(result) => {
+                done.push(scan);
+                pooled.push(result.entry.pooled);
+            }
+            Err(err) => {
+                println!("  {} {}  {err:#}", red("failed "), locate::scan_stem(scan));
+                failed += 1;
+            }
+        }
+    }
+    if done.is_empty() {
+        return Ok(failed);
+    }
+    let predictions = probe.predict_scans(&Matrix::from_rows(&pooled))?;
     let mut tsv = String::from(if classes.is_some() {
         "scan\tprediction\tprobability\n"
     } else {
         "scan\tprediction\n"
     });
-    for (scan, &value) in scans.iter().zip(&predictions) {
+    for (scan, &value) in done.iter().zip(&predictions) {
         let shown = tsv_cell(&scan.display().to_string());
         match classes {
             Some((negative, positive)) => {
@@ -376,66 +564,106 @@ fn apply_scan_level(
             }
         }
     }
-    let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(&scans[0]));
+    let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(&scans.paths[0]));
     let path = out_root.join(format!("{name}_predictions.tsv"));
     outputs::write_atomic(&path, tsv.as_bytes())?;
     println!("{} wrote {}", green("✓"), path.display());
-    Ok(())
+    Ok(failed)
 }
 
-/// A native-space mask and a grid probability map for every scan.
+/// A native-space mask and a grid probability map for every scan. Two scans that would write the
+/// same files stop the run before anything is written; a scan that fails is reported and the others
+/// go on. Returns how many failed.
 fn apply_segmentation(
     probe: &Probe,
     name: &str,
-    scans: &[PathBuf],
+    scans: &Scans,
     pipeline: &mut Pipeline,
     out: Option<&Path>,
     device: DeviceChoice,
-) -> Result<()> {
+) -> Result<usize> {
     let device = device::segmentation_device(device)?;
-    for scan in scans {
+    let destinations: Vec<(PathBuf, ScanOutputs)> = scans
+        .paths
+        .iter()
+        .map(|scan| {
+            let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(scan));
+            let outputs = ScanOutputs::new(&out_root, scan, scans.root);
+            (out_root, outputs)
+        })
+        .collect();
+    let targets: Vec<(&Path, PathBuf)> = scans
+        .paths
+        .iter()
+        .zip(&destinations)
+        .map(|(scan, (_, o))| (scan.as_path(), o.probe_mask(name)))
+        .collect();
+    check_unique_outputs(&targets)?;
+
+    let mut failed = 0;
+    for (scan, (out_root, outputs)) in scans.paths.iter().zip(&destinations) {
         let start = Instant::now();
-        let ScanResult { entry, nifti, prepared, .. } = pipeline.run(scan, true)?;
-        let grid = &entry.info.grid;
-        let features = Matrix::new(entry.coords.len(), entry.width(), entry.tokens);
-        let (probabilities, threshold) = probe.predict_patches(&features, &device)?;
-        let patch_voxels = grid.patch.pow(3);
-        if probabilities.len() != entry.coords.len() * patch_voxels {
-            bail!("the probe does not predict the {patch_voxels} voxels of this model's patches");
+        let result = segment_one(probe, name, scan, scans.reference, pipeline, &device, out_root, outputs);
+        match result {
+            Ok((mask_ml, threshold)) => println!(
+                "  {}  {mask_ml:.1} ml at threshold {threshold:.4} · {} · {}",
+                locate::scan_stem(scan),
+                secs(start.elapsed().as_secs_f64()),
+                dim(&outputs.probe_mask(name).display().to_string())
+            ),
+            Err(err) => {
+                println!("  {} {}  {err:#}", red("failed "), locate::scan_stem(scan));
+                failed += 1;
+            }
         }
-        let probability = assemble_patches(&probabilities, &entry.coords, grid.patch, grid.shape, 0.0f32);
-        // probe.py::dice_by_threshold: a voxel is in the mask when p >= threshold
-        let grid_mask = probability.mapv(|p| u8::from(p >= threshold));
-
-        let (nifti, prepared) = match (nifti, prepared) {
-            (Some(nifti), Some(prepared)) => (nifti, prepared),
-            _ => prepare_again(pipeline.model(), scan)?,
-        };
-        if prepared.fit_affine.0 != grid.fit_affine {
-            eprintln!("{} {}: the grid differs from the cached one", yellow("warning:"), scan.display());
-        }
-        let native = prepared.to_native(grid_mask.view())?;
-        let mask_ml = native.iter().filter(|&&v| v > 0).count() as f64
-            * prepared.native_affine.determinant3().abs()
-            / 1000.0;
-        let mut mask_image = nifti.with_data(VoxelData::U8(native.into_dyn()));
-        // the scan's display window means nothing for a 0/1 mask
-        mask_image.header.cal_min = 0.0;
-        mask_image.header.cal_max = 0.0;
-
-        let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(scan));
-        let outputs = ScanOutputs::new(&out_root, scan);
-        outputs.create_dir()?;
-        outputs::ensure_dataset_description(&out_root)?;
-        mask_image.write(outputs.probe_mask(name))?;
-        Nifti::new(VoxelData::F32(probability.into_dyn()), &prepared.fit_affine)
-            .write(outputs.probe_probseg(name))?;
-        println!(
-            "  {}  {mask_ml:.1} ml at threshold {threshold:.4} · {} · {}",
-            locate::scan_stem(scan),
-            secs(start.elapsed().as_secs_f64()),
-            dim(&outputs.probe_mask(name).display().to_string())
-        );
     }
-    Ok(())
+    Ok(failed)
+}
+
+/// One scan's segmentation: the mask volume (ml) and the threshold used.
+#[allow(clippy::too_many_arguments)]
+fn segment_one(
+    probe: &Probe,
+    name: &str,
+    scan: &Path,
+    reference: Option<&Path>,
+    pipeline: &mut Pipeline,
+    device: &larmor_probe::Device,
+    out_root: &Path,
+    outputs: &ScanOutputs,
+) -> Result<(f64, f32)> {
+    let ScanResult { entry, nifti, prepared, .. } = pipeline.run(scan, reference, true)?;
+    let grid = &entry.info.grid;
+    let features = Matrix::new(entry.coords.len(), entry.width(), entry.tokens);
+    let (probabilities, threshold) = probe.predict_patches(&features, device)?;
+    let patch_voxels = grid.patch.pow(3);
+    if probabilities.len() != entry.coords.len() * patch_voxels {
+        bail!("the probe does not predict the {patch_voxels} voxels of this model's patches");
+    }
+    let probability = assemble_patches(&probabilities, &entry.coords, grid.patch, grid.shape, 0.0f32);
+    // probe.py::dice_by_threshold: a voxel is in the mask when p >= threshold
+    let grid_mask = probability.mapv(|p| u8::from(p >= threshold));
+
+    let (nifti, prepared) = match (nifti, prepared) {
+        (Some(nifti), Some(prepared)) => (nifti, prepared),
+        _ => prepare_again(pipeline.model(), scan, reference)?,
+    };
+    if prepared.fit_affine.0 != grid.fit_affine {
+        eprintln!("{} {}: the grid differs from the cached one", yellow("warning:"), scan.display());
+    }
+    let native = prepared.to_native(grid_mask.view())?;
+    let mask_ml = native.iter().filter(|&&v| v > 0).count() as f64
+        * prepared.native_affine.determinant3().abs()
+        / 1000.0;
+    let mut mask_image = nifti.with_data(VoxelData::U8(native.into_dyn()));
+    // the scan's display window means nothing for a 0/1 mask
+    mask_image.header.cal_min = 0.0;
+    mask_image.header.cal_max = 0.0;
+
+    outputs.create_dir()?;
+    outputs::ensure_dataset_description(out_root)?;
+    mask_image.write(outputs.probe_mask(name))?;
+    Nifti::new(VoxelData::F32(probability.into_dyn()), &prepared.fit_affine)
+        .write(outputs.probe_probseg(name))?;
+    Ok((mask_ml, threshold))
 }

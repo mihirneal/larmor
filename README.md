@@ -11,8 +11,8 @@ PyTorch code it mirrors ([MedARC-AI/nanobrain](https://github.com/MedARC-AI/nano
   Python at run time.
 - **Model-agnostic.** A model is a `model.toml` manifest (architecture, preprocessing recipe, weights and
   their SHA-256), not code. nanobrain's ViT is the first one.
-- **Encode once.** Embeddings are cached by scan hash, preprocessing version and model hash, so a new
-  probe trains on the cache and never re-runs the encoder.
+- **Encode once.** Embeddings are cached by scan hash, preprocessing version, encoder (weights and every
+  architecture value) and precision, so a new probe trains on the cache and never re-runs the encoder.
 - **Same numbers as the eval framework.** Probes reproduce nanobrain's eval: the same CV folds, solvers,
   metrics and bootstrap resamples.
 
@@ -26,7 +26,7 @@ Work in progress (phases 0–2 of [docs/DESIGN.md](docs/DESIGN.md)).
 | nanobrain eval preprocessing recipe | `larmor-prep` | Done: bit-identical to nibabel/scipy/numpy at every stage on 25 fixture scans, about 9× faster than the Python pipeline |
 | 3D ViT encoder | `larmor-model` | Done, on Candle (Metal, CUDA, CPU): parity passes against PyTorch on all 29 references in f32, f16 and bf16 (f32 min token cosine > 0.99999); ViT-S patch 8 encodes in about 0.15 s on an M3 Ultra |
 | Ridge, logistic and segmentation probes | `larmor-probe` | Matches nanobrain's eval framework (folds, chosen hyperparameters, metrics, bootstrap CIs) |
-| `larmor` command line | `larmor` | Done for phases 0–2: encode (with the embedding cache), probe fit/apply, models, check-parity and bench ([docs/CLI.md](docs/CLI.md)); every parity gate passes end to end on the 25 fixture scans |
+| `larmor` command line | `larmor` | Done for phases 0–2: encode (with the embedding cache, and multi-modal input on a reference scan's head mask), probe fit/apply, models, check-parity and bench ([docs/CLI.md](docs/CLI.md)); every parity gate passes end to end on the 25 fixture scans |
 
 Not yet: DICOM, watching a Box Drive folder, and the viewer.
 

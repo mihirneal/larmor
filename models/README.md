@@ -21,8 +21,14 @@ order, and the first manifest whose `id` matches wins (`<id>.toml` first, then a
 `larmor models list` prints the folders and every manifest it finds, with the weights status;
 `larmor models verify [ID]` recomputes the weights SHA-256.
 
-The embedding cache key includes the weights SHA-256, so replacing the weights never mixes old and new
-embeddings, and a probe refuses embeddings from weights other than the ones it was trained on.
+The embedding cache key includes an encoder key: the weights SHA-256 and every `[architecture]` and
+`[readout]` value, so replacing the weights, or correcting a value such as `heads` or `norm_eps`, never
+mixes old and new embeddings, and a probe refuses embeddings from another encoder than the one it was
+trained on.
+
+A manifest's `id` is letters, digits, `.`, `_` and `-` (starting with a letter or digit, at most 64): it
+names cache folders and output files, so write `org--name` rather than `org/name`. `[weights] file` is a
+plain file name: the weights always sit next to the manifest.
 
 ## nanobrain checkpoints
 
@@ -51,9 +57,11 @@ larmor encode /data/bids --model nanobrain-vits-p8
 To share a model, upload the `.safetensors` somewhere and put its address in the manifest's
 `[weights] url`; others copy the manifest into one of the folders above and run
 `larmor models download nanobrain-vits-p8`, which fetches the file next to the manifest and refuses it
-unless its SHA-256 matches. For Hugging Face URLs (`https://huggingface.co/...`, `https://hf.co/...`),
-`HF_TOKEN`, when set, is sent as a bearer token so private repositories work; it is never sent to any
-other host.
+unless its SHA-256 matches. The URL must be `https://` (`--allow-http` for a local server), and an existing
+file with another SHA-256 is only replaced with `--force`. For Hugging Face URLs
+(`https://huggingface.co/...`, `https://hf.co/...`), `HF_TOKEN`, when set, is sent as a bearer token so
+private repositories work; it is never sent to any other host (the host is parsed, so
+`https://huggingface.co@other.host/` does not count, and such URLs are refused).
 
 ## Reference models
 

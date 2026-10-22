@@ -9,7 +9,7 @@ use larmor_model::{DeviceChoice, Precision};
 use larmor_volume::Nifti;
 use serde::Serialize;
 
-use crate::cache::CacheEntry;
+use crate::cache::{CacheEntry, EntryKey};
 use crate::console::{bold, dim, secs};
 use crate::hashing::sha256_hex;
 use crate::machine::{Load, Machine};
@@ -110,10 +110,13 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
         }
         tokens = encoded.n_tokens;
         let encoding = Encoding::new(&encoder, s.clone(), now());
-        let info = RunInfo::new(&model, encoding, &scan, &sha, &nifti, &prepared, tokens)?;
+        let info = RunInfo::new(&model, encoding, &scan, &sha, &nifti, &prepared, tokens, None)?;
+        let key =
+            EntryKey { scan_sha256: &sha, reference_sha256: None, precision: encoder.options().precision };
         let start = Instant::now();
         CacheEntry::write(
             &scratch.join("entry.safetensors"),
+            &key,
             &encoded.tokens,
             &patch_tokens.coords,
             &encoded.pooled,

@@ -1,15 +1,16 @@
 //! Files written to the BIDS derivatives folder: per-scan names, `.npy` arrays, JSON sidecars and
 //! the derivative `dataset_description.json`.
 
-use std::io::Write;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::locate;
 
-/// The output files of one scan: `<out>/<sub-XX/[ses-YY/]datatype or stem>/<stem>_...`.
+/// The output files of one scan: `<out>/<sub-XX/[ses-YY/]datatype, folders below the inputs, or
+/// stem>/<stem>_...` (see [`locate::output_subdir`]).
 #[derive(Clone, Debug)]
 pub struct ScanOutputs {
     pub dir: PathBuf,
@@ -17,8 +18,12 @@ pub struct ScanOutputs {
 }
 
 impl ScanOutputs {
-    pub fn new(out_root: &Path, scan: &Path) -> ScanOutputs {
-        ScanOutputs { dir: out_root.join(locate::output_subdir(scan)), stem: locate::scan_stem(scan) }
+    /// `input_root` is the inputs' common folder ([`locate::FoundScans::root`]).
+    pub fn new(out_root: &Path, scan: &Path, input_root: Option<&Path>) -> ScanOutputs {
+        ScanOutputs {
+            dir: out_root.join(locate::output_subdir(scan, input_root)),
+            stem: locate::scan_stem(scan),
+        }
     }
 
     fn file(&self, suffix: &str) -> PathBuf {
@@ -88,16 +93,30 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     write_atomic(path, (serde_json::to_string_pretty(value)? + "\n").as_bytes())
 }
 
-/// Writes through a temporary file and a rename, so readers never see half a file.
+/// Writes through a synced, uniquely named temporary file and a rename, so readers (and an
+/// interrupted run) never see half a file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    larmor_volume::write_atomic(path, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Fails before anything is written when two scans would write the same output file. Paths are
+/// compared case-insensitively: on macOS's and Windows' default file systems `Brain` and `brain`
+/// are the same file.
+pub fn check_unique_outputs(targets: &[(&Path, PathBuf)]) -> Result<()> {
+    let mut seen: HashMap<String, &Path> = HashMap::new();
+    for (scan, target) in targets {
+        let folded = target.to_string_lossy().to_lowercase();
+        if let Some(other) = seen.insert(folded, scan) {
+            bail!(
+                "{} and {} would both write {} (file names that differ only in case are the same file on \
+                 macOS); pass their folders together so the outputs mirror them, or use different --out folders",
+                other.display(),
+                scan.display(),
+                target.display()
+            );
+        }
     }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
-    file.write_all(bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    drop(file);
-    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    Ok(())
 }
 
 /// Writes the BIDS derivative `dataset_description.json` at the derivatives root, unless one is
@@ -128,6 +147,17 @@ pub fn tsv_cell(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outputs_differing_only_in_case_collide() {
+        let (a, b) = (Path::new("a/Brain.nii.gz"), Path::new("b/brain.nii.gz"));
+        let targets =
+            [(a, PathBuf::from("out/Brain/Brain_x.npy")), (b, PathBuf::from("out/brain/brain_x.npy"))];
+        let err = check_unique_outputs(&targets).unwrap_err().to_string();
+        assert!(err.contains("a/Brain.nii.gz and b/brain.nii.gz"), "{err}");
+        let distinct = [(a, PathBuf::from("out/a/Brain_x.npy")), (b, PathBuf::from("out/b/brain_x.npy"))];
+        check_unique_outputs(&distinct).unwrap();
+    }
 
     #[test]
     fn npy_header_is_aligned_and_parsable() {

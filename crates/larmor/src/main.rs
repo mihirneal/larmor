@@ -79,9 +79,13 @@ struct EncodeArgs {
     /// Derivatives folder (default: <BIDS root>/derivatives/larmor, else ./derivatives/larmor).
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Prepare every scan on this scan's head mask and grid: another modality of the same subject on
+    /// the same voxel grid, as the eval framework prepares ADC and DWI on the FLAIR's mask.
+    #[arg(long, value_name = "SCAN")]
+    reference: Option<PathBuf>,
     #[command(flatten)]
     compute: ComputeArgs,
-    /// Encode again even if the cache has the embedding.
+    /// Encode again even if the cache has the embedding, and replace outputs another scan wrote.
     #[arg(long)]
     force: bool,
     /// Also write the quantized model-grid image and its head mask as NIfTI.
@@ -158,6 +162,9 @@ struct ApplyArgs {
     /// Use this model id or model.toml instead of the probe's model id (it must have the same weights).
     #[arg(long)]
     model: Option<String>,
+    /// Prepare every scan on this scan's head mask and grid (see `larmor encode --reference`).
+    #[arg(long, value_name = "SCAN")]
+    reference: Option<PathBuf>,
     #[command(flatten)]
     compute: ComputeArgs,
 }
@@ -207,6 +214,7 @@ fn run(cmd: Cmd) -> Result<()> {
             inputs: args.inputs,
             model: args.model,
             out: args.out,
+            reference: args.reference,
             device: args.compute.device,
             precision: args.compute.precision,
             force: args.force,
@@ -235,6 +243,7 @@ fn run(cmd: Cmd) -> Result<()> {
             inputs: args.inputs,
             out: args.out,
             model: args.model,
+            reference: args.reference,
             device: args.compute.device,
             precision: args.compute.precision,
         }),

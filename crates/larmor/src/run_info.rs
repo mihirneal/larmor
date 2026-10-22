@@ -38,9 +38,38 @@ pub struct RunInfo {
     pub started: String,
     /// RFC 3339 local time the cache entry was written.
     pub finished: String,
+    /// The scan whose head mask and grid were used (`--reference`), when not the scan itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ReferenceInfo>,
     /// Where the embedding is cached and whether this run found it there (run.json only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheInfo>,
+    /// On a cache hit, the run that computed the embedding: its scan path and manifest (another file
+    /// with the same bytes, or another manifest with the same encoder, can have made it) and its
+    /// times (run.json only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_from: Option<EncodedFrom>,
+}
+
+/// A reference scan: another modality of the same subject whose head mask and grid the scan was
+/// preprocessed on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceInfo {
+    /// Absolute path when encoded.
+    pub path: String,
+    /// SHA-256 of the file bytes.
+    pub sha256: String,
+}
+
+/// The run that encoded a cached embedding.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EncodedFrom {
+    /// The scan file that run read.
+    pub scan_path: String,
+    /// The `model.toml` that run used.
+    pub manifest: String,
+    pub started: String,
+    pub finished: String,
 }
 
 /// The encoder that made the embedding.
@@ -49,6 +78,10 @@ pub struct ModelInfo {
     pub id: String,
     /// SHA-256 of the weights file.
     pub sha256: String,
+    /// `Manifest::encoder_key`: the weights, every architecture and readout value and the encoder
+    /// implementation version, hashed (part of the cache key).
+    #[serde(default)]
+    pub encoder_key: String,
     /// The `model.toml` used.
     pub manifest: String,
     pub family: String,
@@ -145,6 +178,7 @@ impl Encoding {
 
 impl RunInfo {
     /// The record of one encode, from the scan, its preprocessing and the model.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &Model,
         encoding: Encoding,
@@ -153,6 +187,7 @@ impl RunInfo {
         nifti: &Nifti,
         prepared: &Prepared,
         n_tokens: usize,
+        reference: Option<ReferenceInfo>,
     ) -> Result<RunInfo> {
         let arch = &model.manifest.architecture;
         let affine = nifti.affine()?;
@@ -161,6 +196,7 @@ impl RunInfo {
             model: ModelInfo {
                 id: model.id().to_string(),
                 sha256: model.weights_sha256(),
+                encoder_key: model.encoder_key.clone(),
                 manifest: absolute(&model.path),
                 family: model.manifest.family.clone(),
                 patch: arch.patch,
@@ -198,8 +234,28 @@ impl RunInfo {
             seconds: encoding.seconds,
             started: encoding.started,
             finished: now(),
+            reference,
             cache: None,
+            encoded_from: None,
         })
+    }
+
+    /// This record as the run.json of `scan` encoded with `model` in this run: on a cache hit the
+    /// scan path and manifest become this run's, and the cached run's go to `encoded_from`.
+    pub fn for_run(&self, model: &Model, scan: &Path, cache: CacheInfo) -> RunInfo {
+        let mut info = self.clone();
+        if cache.hit {
+            info.encoded_from = Some(EncodedFrom {
+                scan_path: info.scan.path.clone(),
+                manifest: info.model.manifest.clone(),
+                started: info.started.clone(),
+                finished: info.finished.clone(),
+            });
+            info.scan.path = absolute(scan);
+            info.model.manifest = absolute(&model.path);
+        }
+        info.cache = Some(cache);
+        info
     }
 }
 

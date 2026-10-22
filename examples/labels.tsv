@@ -6,8 +6,15 @@
 #         eval framework's folds (KFold(5, shuffle, seed 0) for regression and segmentation,
 #         StratifiedKFold(5, shuffle, seed 0) for classification). Fold ids left without rows (all
 #         their labels missing) are closed up: 0, 2, 3 become 0, 1, 2.
+# reference  optional: another scan of the same subject on the same voxel grid whose head mask and
+#         grid this row's scan is prepared on (as `larmor encode --reference`; the eval framework
+#         prepares ADC and DWI on the FLAIR's mask). Empty or n/a: the scan's own mask.
 # others  label columns; pick one with --label. Empty cells and n/a are missing: rows without the
 #         chosen label are left out of that fit.
+#
+# Each scan may appear once: copies in different folds would leak between training and test (a fold
+# column that keeps a scan's copies in one fold is accepted). Spreadsheet exports with a UTF-8 byte
+# order mark are fine.
 #
 #   larmor probe fit examples/labels.tsv --model nanobrain-vits-p8 --kind regression --label age --out age.toml
 #   larmor probe fit examples/labels.tsv --model nanobrain-vits-p8 --kind classification --label group --out group.toml

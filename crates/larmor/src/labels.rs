@@ -7,9 +7,10 @@
 //! ```
 //!
 //! `scan` is a path relative to the TSV (absolute paths work too). Every other column is a label;
-//! `fold` (0-based) optionally fixes the outer cross-validation folds. Empty cells and `n/a` are
-//! missing values: rows missing the label being fitted are left out. A UTF-8 byte order mark
-//! (Excel's "UTF-8" export) is ignored.
+//! `fold` (0-based) optionally fixes the outer cross-validation folds, and `reference` optionally
+//! names, per row, another modality of the subject whose head mask and grid the scan is prepared on
+//! (as `larmor encode --reference`). Empty cells and `n/a` are missing values: rows missing the
+//! label being fitted are left out. A UTF-8 byte order mark (Excel's "UTF-8" export) is ignored.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,8 @@ pub struct LabelRow {
     pub line: usize,
     /// The scan path, resolved against the TSV's folder.
     pub scan: PathBuf,
+    /// The `reference` scan, resolved against the TSV's folder, when the table has one for this row.
+    pub reference: Option<PathBuf>,
     /// The cells, one per column (the `scan` cell included), trimmed.
     pub cells: Vec<String>,
 }
@@ -55,6 +58,9 @@ pub fn is_missing(cell: &str) -> bool {
     cell.is_empty() || cell.eq_ignore_ascii_case("n/a")
 }
 
+/// Columns that are not labels.
+const RESERVED: [&str; 3] = ["scan", "fold", "reference"];
+
 impl LabelTable {
     pub fn read(path: &Path) -> Result<LabelTable> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -72,6 +78,7 @@ impl LabelTable {
         let scan_column = columns.iter().position(|c| c == "scan").with_context(|| {
             format!("{} has no `scan` column (columns: {})", path.display(), columns.join(", "))
         })?;
+        let reference_column = columns.iter().position(|c| c == "reference");
         let mut rows = Vec::new();
         for (index, line) in lines {
             let cells: Vec<String> = line.split('\t').map(|c| c.trim().to_string()).collect();
@@ -90,7 +97,9 @@ impl LabelTable {
                 index + 1
             );
             let scan = base.join(&cells[scan_column]);
-            rows.push(LabelRow { line: index + 1, scan, cells });
+            let reference =
+                reference_column.map(|c| &cells[c]).filter(|c| !is_missing(c)).map(|c| base.join(c));
+            rows.push(LabelRow { line: index + 1, scan, reference, cells });
         }
         ensure!(!rows.is_empty(), "{} has no rows", path.display());
         Ok(LabelTable { path: path.to_path_buf(), sha256: sha256_hex(&bytes), columns, rows })
@@ -98,8 +107,8 @@ impl LabelTable {
 
     fn column_index(&self, name: &str) -> Result<usize> {
         let labels: Vec<&str> =
-            self.columns.iter().map(String::as_str).filter(|c| *c != "scan" && *c != "fold").collect();
-        if name == "scan" || name == "fold" {
+            self.columns.iter().map(String::as_str).filter(|c| !RESERVED.contains(c)).collect();
+        if RESERVED.contains(&name) {
             bail!("`{name}` is not a label column; labels in {}: {}", self.path.display(), labels.join(", "));
         }
         self.columns.iter().position(|c| c == name).with_context(|| {
@@ -270,6 +279,17 @@ mod tests {
         assert_eq!(t.column("age").unwrap().numbers(&t.path).unwrap(), vec![30.0]);
         let (_dir, t) = table("\u{feff}# exported from Excel\nscan\tage\na.nii.gz\t30\n");
         assert_eq!(t.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_reference_column_is_not_a_label() {
+        let (dir, t) = table(
+            "scan\treference\tlesion\nadc.nii.gz\tflair.nii.gz\tseg.nii.gz\nb.nii.gz\tn/a\tseg2.nii.gz\n",
+        );
+        assert_eq!(t.rows[0].reference, Some(dir.path().join("flair.nii.gz")));
+        assert_eq!(t.rows[1].reference, None);
+        assert!(t.column("reference").is_err());
+        assert_eq!(t.column("lesion").unwrap().values.len(), 2);
     }
 
     #[test]

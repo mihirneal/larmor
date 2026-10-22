@@ -64,16 +64,18 @@ fn encode_and_probes_on_fixture_scans() {
     let out = ws.ok(&["encode", &scans_dir, "--model", &model]);
     assert!(out.contains(&format!("0 encoded, {} cached, 0 failed", scans.len())), "{out}");
 
-    // scan-level labels for every scan: head volume (regression) and T1w or not (classification);
+    // scan-level labels for every scan: head volume (regression) and MNI template or OpenNeuro scan
+    // (classification: 15 vs 10, so every outer training fold keeps at least 5 of each class, which
+    // LogisticRegressionCV's inner StratifiedKFold(5) needs; T1w or not, 19 vs 6, does not);
     // for ten scans a 25 mm sphere above the grid centre drawn in each scan's own voxels
     // (segmentation, two folds fixed by the fold column)
-    let mut scan_tsv = String::from("scan\thead_ml\tt1w\n");
+    let mut scan_tsv = String::from("scan\thead_ml\ttemplate\n");
     let mut seg_tsv = String::from("scan\tsphere\tfold\n");
-    for (i, (name, file, modality)) in scans.iter().enumerate() {
+    for (i, (name, file, _)) in scans.iter().enumerate() {
         let run = read_json(&ws.path(&format!("derivatives/larmor/{name}/{name}_model-{MODEL}_run.json")));
         let head_ml = run["head_volume_ml"].as_f64().unwrap();
-        let t1w = u8::from(modality == "T1w");
-        scan_tsv.push_str(&format!("{}\t{head_ml}\t{t1w}\n", file.display()));
+        let template = u8::from(name.starts_with("mni152"));
+        scan_tsv.push_str(&format!("{}\t{head_ml}\t{template}\n", file.display()));
         if i < 10 {
             let fit: [[f64; 4]; 4] = serde_json::from_value(run["grid"]["fit_affine"].clone()).unwrap();
             let path = ws.path(&format!("labels/{name}_label-sphere_roi.nii.gz"));
@@ -86,7 +88,7 @@ fn encode_and_probes_on_fixture_scans() {
 
     for (table, kind, label) in [
         ("labels.tsv", "regression", "head_ml"),
-        ("labels.tsv", "classification", "t1w"),
+        ("labels.tsv", "classification", "template"),
         ("seg_labels.tsv", "segmentation", "sphere"),
     ] {
         let probe = format!("probes/{label}.toml");
@@ -100,7 +102,7 @@ fn encode_and_probes_on_fixture_scans() {
     }
 
     let three: Vec<String> = scans.iter().take(3).map(|(_, file, _)| file.display().to_string()).collect();
-    for label in ["head_ml", "t1w"] {
+    for label in ["head_ml", "template"] {
         let probe = format!("probes/{label}.toml");
         let mut args = vec!["probe", "apply", probe.as_str(), "--model", &model, "--out", "applied"];
         args.extend(three.iter().map(String::as_str));

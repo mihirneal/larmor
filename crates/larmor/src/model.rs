@@ -17,6 +17,9 @@ pub struct Model {
     pub recipe: Recipe,
     /// [`Recipe::version_hash`], the preprocessing part of cache keys.
     pub prep_version: String,
+    /// [`Manifest::encoder_key`], the encoder part of cache keys: the weights, every architecture
+    /// and readout value, and the encoder implementation version.
+    pub encoder_key: String,
 }
 
 impl Model {
@@ -34,7 +37,8 @@ impl Model {
             );
         }
         let prep_version = recipe.version_hash();
-        Ok(Model { manifest, path, recipe, prep_version })
+        let encoder_key = manifest.encoder_key();
+        Ok(Model { manifest, path, recipe, prep_version, encoder_key })
     }
 
     /// Reads and checks a `model.toml`.

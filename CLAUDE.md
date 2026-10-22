@@ -50,8 +50,15 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
   mean depends on its thread count; Larmor keeps the exactly rounded mean.
 - **Runtime: Candle, not Burn.** Both passed parity; Burn was 2–3× slower on Metal (see DESIGN.md). Fused
   `sdpa` on Metal, chunked attention elsewhere. `f16`/`bf16` are autocast-like and GPU-only.
-- **Cache:** key = scan bytes SHA-256 + recipe `version_hash` (includes `larmor_prep::IMPL_VERSION`) + weights
-  SHA-256. Bump `IMPL_VERSION` whenever a change could move any preprocessing output.
+- **Cache:** key = scan bytes SHA-256 (+ the reference scan's for multi-modal input) + recipe `version_hash`
+  (includes `larmor_prep::IMPL_VERSION`) + `Manifest::encoder_key` (weights SHA-256, every architecture and
+  readout value, `larmor_model::ENCODER_IMPL_VERSION`) + precision. Bump `IMPL_VERSION` whenever a change
+  could move any preprocessing output, and `ENCODER_IMPL_VERSION` for any encoder output.
+- **Multi-modal input:** `Recipe::run_with_reference` / `--reference` mirrors `prepare_images(...,
+  reference=)` (FOMO tasks 1 and 2: ADC and DWI on the FLAIR's mask). `fomo_task5_t1w_pmg`'s
+  `strip_and_crop_ap` (SynthSeg brain mask and AP crop) is not supported.
+- **Fail where the eval framework fails:** inputs that make sklearn or torch raise (too few of a class per
+  training fold, NaN features, empty subsampled segmentation sets) are errors, not numbers.
 - **Probes match the eval framework:** sklearn's folds and numpy's bootstrap resamples are reproduced exactly
   (MT19937 and PCG64 ports). The segmentation probe converges to the exact optimum; torch's L-BFGS stops a
   little short of it, so out-of-fold probabilities differ from torch's by up to about 1.5e-2 while the chosen
@@ -61,7 +68,8 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
 
 ## Status and open questions
 
-- Phases 0–2 are done: `larmor encode`, the cache, probes and every parity gate pass on all 25 fixtures.
+- Phases 0–2 are done: `larmor encode`, the cache, probes and every parity gate pass on all 25 fixtures and
+  the multi-modal pair (`[[pair]]` in `fixtures/manifest.toml`).
 - Not yet: Phase 3 (DICOM through dicom-rs, `larmor watch` on a Box Drive folder via `site.toml`) and
   Phase 4 (the egui viewer).
 - Open: which trained checkpoint ships first (rerun `check-parity` with it); the CUDA build (`--features cuda`)
