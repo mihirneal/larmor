@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use larmor_dicom::SeriesInfo;
 use larmor_model::{DeviceChoice, Encoder, Precision};
 use larmor_prep::{IMPL_VERSION, Prepared};
 use larmor_volume::{Nifti, aff2axcodes};
@@ -57,7 +58,7 @@ pub struct RunInfo {
 pub struct ReferenceInfo {
     /// Absolute path when encoded.
     pub path: String,
-    /// SHA-256 of the file bytes.
+    /// SHA-256 of the file bytes (of a DICOM series, as for the scan).
     pub sha256: String,
 }
 
@@ -104,9 +105,10 @@ pub struct PrepInfo {
 /// The input scan, as its header describes it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScanInfo {
-    /// Absolute path when encoded.
+    /// Absolute path when encoded: the NIfTI file, or the DICOM series' folder.
     pub path: String,
-    /// SHA-256 of the file bytes.
+    /// SHA-256 of the file bytes; for a DICOM series, `larmor_dicom::series_sha256` (its files'
+    /// SHA-256s, sorted, with the conversion's version).
     pub sha256: String,
     pub shape: Vec<usize>,
     /// Header voxel sizes (mm).
@@ -117,6 +119,45 @@ pub struct ScanInfo {
     pub dtype: String,
     /// Voxel-to-world affine of the scan.
     pub affine: [[f64; 4]; 4],
+    /// For a DICOM series: what it is and how it was converted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dicom: Option<DicomInfo>,
+}
+
+/// A DICOM series, converted to the image dcm2niix writes for it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DicomInfo {
+    pub series_instance_uid: String,
+    pub series_number: Option<i32>,
+    pub series_description: String,
+    pub protocol_name: String,
+    pub modality: String,
+    pub manufacturer: String,
+    /// Slices (files) in the volume.
+    pub slices: usize,
+    pub transfer_syntaxes: Vec<String>,
+    /// `larmor-dicom <IMPL_VERSION> (dcm2niix <version>)`: the conversion and what it reproduces.
+    pub conversion: String,
+}
+
+impl DicomInfo {
+    pub fn of(series: &SeriesInfo) -> DicomInfo {
+        DicomInfo {
+            series_instance_uid: series.series_instance_uid.clone(),
+            series_number: series.series_number,
+            series_description: series.description.clone(),
+            protocol_name: series.protocol_name.clone(),
+            modality: series.modality.clone(),
+            manufacturer: series.manufacturer.clone(),
+            slices: series.slices,
+            transfer_syntaxes: series.transfer_syntaxes.clone(),
+            conversion: format!(
+                "larmor-dicom {} (dcm2niix {})",
+                larmor_dicom::IMPL_VERSION,
+                larmor_dicom::DCM2NIIX_VERSION
+            ),
+        }
+    }
 }
 
 /// The model grid the scan was resampled onto.
@@ -185,6 +226,7 @@ impl RunInfo {
         scan: &Path,
         sha: &str,
         nifti: &Nifti,
+        dicom: Option<&SeriesInfo>,
         prepared: &Prepared,
         n_tokens: usize,
         reference: Option<ReferenceInfo>,
@@ -216,6 +258,7 @@ impl RunInfo {
                 orientation: aff2axcodes(&affine).unwrap_or_else(|_| "?".into()),
                 dtype: nifti.data.dtype().name().to_string(),
                 affine: affine.0,
+                dicom: dicom.map(DicomInfo::of),
             },
             grid: GridInfo {
                 shape: prepared.grid_shape(),

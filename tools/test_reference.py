@@ -50,10 +50,10 @@ def patchify(image: np.ndarray, patch: int) -> np.ndarray:
     return blocks.reshape(gx * gy * gz, patch**3)
 
 
-def test_manifest_lists_about_twenty_unique_scans():
+def test_manifest_lists_about_forty_unique_scans():
     names = [scan["name"] for scan in SCANS]
     assert len(names) == len(set(names))
-    assert 18 <= len(names) <= 30
+    assert 30 <= len(names) <= 45
     for scan in SCANS:
         assert {"name", "file", "source", "license", "sha256", "modality", "notes", "encode"} <= scan.keys()
         assert "nanobrain-vits-p8-ref" in scan["encode"]
@@ -172,3 +172,22 @@ def test_encode_reference(item):
     assert np.isfinite(t["tokens"]).all() and np.isfinite(t["tokens_bf16"]).all()
     assert np.allclose(t["pooled"], t["tokens"].mean(axis=0, dtype=np.float64), atol=1e-5)
     assert np.allclose(t["pooled_bf16"], t["tokens_bf16"].mean(axis=0, dtype=np.float64), atol=1e-5)
+
+
+DICOM = MANIFEST.get("dicom", [])
+
+
+@pytest.mark.parametrize("entry", DICOM, ids=lambda e: e["name"])
+def test_dicom_set_matches_manifest(entry):
+    from fetch_fixtures import files_sha256
+
+    folder = FIXTURES / entry["folder"]
+    assert files_sha256(folder) == entry["files_sha256"]
+    assert sum(1 for p in folder.rglob("*") if p.is_file()) == entry["files"]
+    assert entry["kind"] in ("series", "refuse", "pixels")
+    if entry["kind"] == "series":
+        assert entry["scan"] in {scan["name"] for scan in SCANS}
+        sidecar = REFERENCE / "dicom" / entry["name"] / "dcm2niix.json"
+        assert json.loads(sidecar.read_text())["ConversionSoftwareVersion"] == "v1.0.20260724"
+    if entry["kind"] == "refuse":
+        assert entry["refuse"]

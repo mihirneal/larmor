@@ -22,20 +22,22 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
 | `docs/DESIGN.md` | The contract: recipe, manifest, fixture layouts, cache, probes, gates, runtime choice |
 | `docs/CLI.md` | Every command, flag and output file |
 | `crates/larmor-volume` | NIfTI I/O, affines, orientation, resampling, Gaussian filter, morphology, quantiles (mirrors nibabel, scipy.ndimage, numpy) |
+| `crates/larmor-dicom` | DICOM series (dicom-rs) to the NIfTI image dcm2niix v1.0.20260724 writes, bit for bit; synthetic series for tests |
 | `crates/larmor-prep` | The `nanobrain-eval` preprocessing recipe, tokens, mapping back to native space |
 | `crates/larmor-model` | `model.toml` manifests, safetensors weights, the 3D ViT encoder on Candle |
 | `crates/larmor-probe` | Ridge, logistic and segmentation probes, sklearn-identical folds, numpy RNG ports, metrics, probe files |
-| `crates/larmor` | The CLI: `encode`, `probe fit`/`apply`, `models`, `check-parity`, `bench` |
-| `tools/` | Python reference tools (pinned to nanobrain's `uv.lock`): fixtures, PyTorch references, checkpoint export |
-| `fixtures/` | Not committed. 25 scans plus their references, rebuilt by `tools/setup_fixtures.sh` |
+| `crates/larmor` | The CLI: `encode`, `probe fit`/`apply`, `watch`, `models`, `check-parity`, `bench` |
+| `examples/` | `labels.tsv` and `site.toml` (for `larmor watch`), annotated; never real lab paths |
+| `tools/` | Python reference tools (pinned to nanobrain's `uv.lock`, plus dcm2niix): fixtures, PyTorch references, checkpoint export |
+| `fixtures/` | Not committed. 36 scans, 15 DICOM sets and their references, rebuilt by `tools/setup_fixtures.sh`. In a worktree, symlink it: `ln -s /Users/mihir/Developer/larmor/fixtures fixtures` |
 
 ## Checks
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
   CI on GitHub runs these on macOS, and builds and tests on Linux.
 - Parity (needs `fixtures/`): `cargo test --workspace --release -- --ignored` and
-  `target/release/larmor check-parity fixtures` (both reference models; exits nonzero if any gate fails).
-  Run these after any change to preprocessing, the encoder or the probes.
+  `target/release/larmor check-parity fixtures` (both reference models and the DICOM sets; exits nonzero if
+  any gate fails). Run these after any change to preprocessing, the encoder, the probes or the DICOM reader.
 - Timings: run `larmor bench` on a quiet machine (no other builds or GPU jobs) and say so next to the numbers.
 
 ## Design decisions
@@ -54,6 +56,20 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
   (includes `larmor_prep::IMPL_VERSION`) + `Manifest::encoder_key` (weights SHA-256, every architecture and
   readout value, `larmor_model::ENCODER_IMPL_VERSION`) + precision. Bump `IMPL_VERSION` whenever a change
   could move any preprocessing output, and `ENCODER_IMPL_VERSION` for any encoder output.
+- **DICOM:** the target is dcm2niix v1.0.20260724's NIfTI (default options) as nibabel loads it, because
+  that is how the lab's data reach nanobrain; `larmor-dicom` ports `saveDcm2NiiCore` for one 3-D classic
+  volume (instance-number sort, position re-sort, `nifti_dicom2mat`, `nii_flipZ`, `nii_setOrtho` for 3-D
+  acquisitions, `nii_flipY` otherwise, Philips precise scaling) in float32 with clang's fused multiply-adds
+  (`-ffp-contract=on`), so affines are bit-identical to the macOS/PyPI build. What dcm2niix would not write
+  as one volume (localizers, 4-D, several echoes, varying spacing, mosaics) is refused with the reason.
+  Enhanced multi-frame and JPEG-LS are refused for now. Bump `larmor_dicom::IMPL_VERSION` for any change
+  that could move a converted image: it is part of a series' SHA-256 and so of its cache key.
+- **Gate data for DICOM:** CC0 DICOM of MR heads is scarce (OpenNeuro keeps NIfTI), so the fixtures use
+  dcm2niix's own validation sets (`neurolabusc/dcm_qa_*`, BSD-2-Clause), pinned by commit and git blob SHA-1.
+- **Watching:** `larmor watch` polls (cloud folders such as Box Drive do not deliver file events reliably)
+  and waits until files have not changed for `settle_seconds` of its own observation; a DICOM series waits
+  for its whole folder. A ledger keyed by file sizes and times plus the models' encoder keys makes restarts
+  cheap and re-encodes series that grow.
 - **Multi-modal input:** `Recipe::run_with_reference` / `--reference` mirrors `prepare_images(...,
   reference=)` (FOMO tasks 1 and 2: ADC and DWI on the FLAIR's mask). `fomo_task5_t1w_pmg`'s
   `strip_and_crop_ap` (SynthSeg brain mask and AP crop) is not supported.
@@ -68,12 +84,15 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
 
 ## Status and open questions
 
-- Phases 0–2 are done: `larmor encode`, the cache, probes and every parity gate pass on all 25 fixtures and
-  the multi-modal pair (`[[pair]]` in `fixtures/manifest.toml`).
-- Not yet: Phase 3 (DICOM through dicom-rs, `larmor watch` on a Box Drive folder via `site.toml`) and
-  Phase 4 (the egui viewer).
+- Phases 0–3 are done: `larmor encode` (NIfTI and DICOM), the cache, probes, `larmor watch` and every parity
+  gate pass on all 36 fixture scans, the multi-modal pair and the 15 DICOM sets (`[[pair]]` and `[[dicom]]`
+  in `fixtures/manifest.toml`).
+- Not yet: Phase 4 (the egui viewer); enhanced multi-frame DICOM (Philips and Siemens XA export it; the
+  dcm_qa_philips_enh and dcm_qa_enh repositories have sets with dcm2niix references) and JPEG-LS (needs
+  CharLS, C++).
 - Open: which trained checkpoint ships first (rerun `check-parity` with it); the CUDA build (`--features cuda`)
-  is untested because it needs the CUDA toolkit; check-parity against references made on the cluster.
+  is untested because it needs the CUDA toolkit; check-parity against references made on the cluster; a
+  `watch` trial on the lab's real Box Drive folder (only local folders are tested).
 
 ## Setup on a new Mac
 

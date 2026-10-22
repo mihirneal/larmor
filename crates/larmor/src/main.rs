@@ -18,7 +18,10 @@ mod phantom;
 mod pipeline;
 mod probe_cmd;
 mod run_info;
+mod scan;
 mod seg_labels;
+mod site;
+mod watch_cmd;
 
 use std::path::PathBuf;
 
@@ -54,6 +57,8 @@ enum Cmd {
     CheckParity(ParityArgs),
     /// Time each stage of one scan on this machine.
     Bench(BenchArgs),
+    /// Watch the folders of a site file and encode scans as they arrive.
+    Watch(WatchArgs),
 }
 
 /// Where the encoder runs.
@@ -70,7 +75,7 @@ struct ComputeArgs {
 
 #[derive(Args)]
 struct EncodeArgs {
-    /// NIfTI files (.nii, .nii.gz) or folders to search recursively.
+    /// NIfTI files (.nii, .nii.gz) or folders to search recursively for NIfTI files and DICOM series.
     #[arg(required = true, value_name = "SCAN_OR_FOLDER")]
     inputs: Vec<PathBuf>,
     /// Model id (looked up in $LARMOR_MODELS, the user data folder, ./models) or path to a model.toml.
@@ -153,7 +158,7 @@ struct FitArgs {
 struct ApplyArgs {
     /// A probe.toml written by `larmor probe fit`.
     probe: PathBuf,
-    /// NIfTI files or folders.
+    /// NIfTI files, or folders to search for NIfTI files and DICOM series.
     #[arg(required = true, value_name = "SCAN_OR_FOLDER")]
     inputs: Vec<PathBuf>,
     /// Output folder (default: the derivatives folder, as for encode).
@@ -178,6 +183,16 @@ struct ParityArgs {
     models: Option<Vec<String>>,
     #[command(flatten)]
     compute: ComputeArgs,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    /// The site file: the folders to watch, the output folder, the models (see examples/site.toml).
+    #[arg(long, value_name = "SITE_TOML")]
+    site: PathBuf,
+    /// Encode the scans that are settled now (after one settle period), then exit.
+    #[arg(long)]
+    once: bool,
 }
 
 #[derive(Args)]
@@ -253,6 +268,9 @@ fn run(cmd: Cmd) -> Result<()> {
             device: args.compute.device,
             precision: args.compute.precision,
         }),
+        Cmd::Watch(args) => {
+            watch_cmd::cmd_watch(watch_cmd::WatchOptions { site: args.site, once: args.once })
+        }
         Cmd::Bench(args) => bench_cmd::cmd_bench(bench_cmd::BenchOptions {
             model: args.model,
             scan: args.scan,

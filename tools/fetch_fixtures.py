@@ -1,16 +1,26 @@
 """Build Larmor's fixture scans (fixtures/scans/) and write fixtures/manifest.toml.
 
     python fetch_fixtures.py            # download and build whatever is missing, then write the manifest
-    python fetch_fixtures.py --force    # also rebuild synthetic variants that already exist
+    python fetch_fixtures.py --force    # also rebuild synthetic and dcm2niix scans that already exist
     python fetch_fixtures.py --check    # only verify the files listed in the manifest
 
-Three kinds of scan, all 3D NIfTI-1 .nii.gz (plus `[[pair]]` entries, below):
+Four kinds of scan, all 3D NIfTI-1 .nii.gz (plus `[[pair]]` and `[[dicom]]` entries, below):
 
 * openneuro: real public scans over anonymous HTTPS, byte-identical to the source and pinned by sha256.
   The DWI b0 is the one derived file: volume 0 cut out of a pinned 4D series kept in fixtures/downloads/.
 * templateflow: MNI templates fetched by the templateflow client (TEMPLATEFLOW_HOME=fixtures/templateflow).
 * synthetic: deterministic nibabel variants of mni152-t1w (and one of ds001246-t1w), chosen so that every
   branch of nanobrain's threshold_mask and conform_image runs on at least one fixture.
+* dcm2niix: the NIfTI the pinned dcm2niix (tools/.venv/bin/dcm2niix, v1.0.20260724) writes for a DICOM
+  series of `[[dicom]]`, gzipped with a fixed header.
+
+A `[[dicom]]` is a DICOM series from dcm2niix's own validation repositories (github.com/neurolabusc/dcm_qa_*,
+BSD-2-Clause), pinned by commit, each file checked against its git blob SHA-1 and the set by `files_sha256`,
+unpacked into fixtures/dicom/<name>/. `kind = "series"` must convert to the `[[scan]]` named `scan`
+(dcm2niix's NIfTI of it) bit for bit and then pass that scan's recipe and encode references; `"refuse"` must
+be refused with a message containing `refuse`; `"pixels"` holds one image in several transfer syntaxes that
+must decode alike. CC0 DICOM of MR heads is scarce (OpenNeuro keeps converted NIfTI, not DICOM), which is why
+these BSD-licensed sets are used; nothing from them is committed.
 
 A `[[pair]]` names two scans of one subject on the same voxel grid, a target prepared on its reference's head
 mask and grid as `eval/prepare.py::prepare_images(images, segs, reference=...)` prepares FOMO tasks 1 and 2 (ADC and
@@ -18,16 +28,24 @@ DWI on the FLAIR's mask); make_reference.py writes their references under refere
 
 Synthetic files are written field by field (so a header is exactly what the fixture tests, including stale
 qform/sform matrices whose code is 0) with a fixed gzip header, so a rebuild with the same zlib gives the
-same bytes. Existing synthetic files are kept unless --force, so their sha256 values stay stable.
+same bytes. Existing synthetic and dcm2niix files are kept unless --force, so their sha256 values stay stable.
 """
 
 import argparse
 import gzip
+import hashlib
+import io
+import json
 import math
 import os
 import shutil
+import subprocess
+import sys
+import tempfile
 import time
+import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -369,6 +387,303 @@ def make_neck_shoulders(base):
 
 
 # ---------------------------------------------------------------------------------------------------------
+# DICOM series and dcm2niix's NIfTI of them
+
+DICOM = FIXTURES / "dicom"
+GITHUB_RAW = "https://raw.githubusercontent.com"
+GITHUB_API = "https://api.github.com"
+DCM2NIIX_VERSION = "v1.0.20260724"
+DCM2NIIX = Path(sys.executable).parent / "dcm2niix"
+
+
+@dataclass(frozen=True)
+class DicomFixture:
+    """A DICOM series from one of dcm2niix's validation repositories (github.com/neurolabusc/dcm_qa_*),
+    pinned by commit; every downloaded file is checked against its git blob SHA-1 in that commit's tree.
+
+    `path` selects the files: a folder, a single .zip file, or a file-name prefix. `unpack` is "files"
+    (copy), "gz" (gunzip each `.gz`) or "zip" (extract). `kind` is "series" (Larmor converts it bit-exact
+    to dcm2niix's NIfTI, the [[scan]] named `scan`, and runs the recipe on it), "refuse" (Larmor refuses it
+    with a message containing `refuse`) or "pixels" (every file decodes to the same samples, except the
+    transfer syntaxes in `unsupported`, which Larmor refuses).
+    """
+
+    name: str
+    repo: str
+    commit: str
+    path: str
+    unpack: str
+    files_sha256: str
+    manufacturer: str
+    modality: str
+    kind: str
+    notes: str
+    scan: str | None = None
+    refuse: str | None = None
+    unsupported: tuple[str, ...] = ()
+
+    @property
+    def folder(self) -> Path:
+        return DICOM / self.name
+
+    @property
+    def source(self) -> str:
+        return f"https://github.com/{self.repo}/tree/{self.commit}/{self.path}"
+
+    @property
+    def license(self) -> str:
+        return f"BSD-2-Clause ({self.repo})"
+
+
+def files_sha256(folder: Path) -> str:
+    """The SHA-256 of a folder's files' SHA-256s, sorted (names and order do not matter)."""
+    digests = sorted(sha256_file(p) for p in folder.rglob("*") if p.is_file())
+    return hashlib.sha256("".join(d + "\n" for d in digests).encode()).hexdigest()
+
+
+def git_tree(repo: str, commit: str) -> list[dict]:
+    """The blobs of a commit's tree, from the GitHub API (cached in fixtures/downloads/github/)."""
+    cache = DOWNLOADS / "github" / f"{repo.replace('/', '--')}@{commit}.json"
+    if not cache.exists():
+        request = urllib.request.Request(f"{GITHUB_API}/repos/{repo}/git/trees/{commit}?recursive=1")
+        if os.environ.get("GITHUB_TOKEN"):
+            request.add_header("Authorization", f"Bearer {os.environ['GITHUB_TOKEN']}")
+        with urllib.request.urlopen(request, timeout=60) as response:
+            tree = json.load(response)
+        assert not tree.get("truncated"), f"{repo}@{commit}: the tree listing is truncated"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps([t for t in tree["tree"] if t["type"] == "blob"]))
+    return json.loads(cache.read_text())
+
+
+def git_blob_sha1(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def fetch_dicom(fixture: DicomFixture) -> None:
+    """Download and unpack the series into fixtures/dicom/<name>/, unless it already holds the pinned files."""
+    if fixture.folder.exists() and files_sha256(fixture.folder) == fixture.files_sha256:
+        return
+    tree = git_tree(fixture.repo, fixture.commit)
+    # a single file (a .zip), a folder's files, or the files whose names start with a prefix
+    if any(b["path"] == fixture.path for b in tree):
+        blobs, base = [b for b in tree if b["path"] == fixture.path], str(Path(fixture.path).parent)
+    elif any(b["path"].startswith(fixture.path + "/") for b in tree):
+        blobs, base = [b for b in tree if b["path"].startswith(fixture.path + "/")], fixture.path
+    else:
+        blobs, base = [b for b in tree if b["path"].startswith(fixture.path)], str(Path(fixture.path).parent)
+    blobs = [b for b in blobs if not Path(b["path"]).name.startswith(".")]
+    assert blobs, f"{fixture.name}: nothing at {fixture.path} in {fixture.repo}@{fixture.commit}"
+    part = fixture.folder.with_name(fixture.folder.name + ".part")
+    shutil.rmtree(part, ignore_errors=True)
+    part.mkdir(parents=True)
+    print(f"  downloading {len(blobs)} files of {fixture.source}")
+    for blob in blobs:
+        url = f"{GITHUB_RAW}/{fixture.repo}/{fixture.commit}/{urllib.parse.quote(blob['path'])}"
+        for attempt in range(1, 5):
+            try:
+                with urllib.request.urlopen(url, timeout=120) as response:
+                    data = response.read()
+                break
+            except OSError as err:
+                if attempt == 4:
+                    raise
+                print(f"  retry {attempt}: {err}")
+                time.sleep(2 * attempt)
+        assert git_blob_sha1(data) == blob["sha"], f"{url}: not the pinned blob"
+        relative = Path(blob["path"]).relative_to(base)
+        if fixture.unpack == "zip":
+            # the archive's files, flattened into the series folder
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                for member in archive.infolist():
+                    name = Path(member.filename)
+                    if member.is_dir() or "__MACOSX" in name.parts or name.name.startswith("."):
+                        continue
+                    target = part / name.name
+                    assert not target.exists(), f"{fixture.name}: two members named {name.name}"
+                    target.write_bytes(archive.read(member))
+        elif fixture.unpack == "gz":
+            assert relative.suffix == ".gz", blob["path"]
+            target = part / relative.with_suffix("")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(gzip.decompress(data))
+        else:
+            (part / relative).parent.mkdir(parents=True, exist_ok=True)
+            (part / relative).write_bytes(data)
+    got = files_sha256(part)
+    if os.environ.get("LARMOR_PRINT_DICOM_HASHES"):
+        print(f"  {fixture.name}: files_sha256 {got}")
+    else:
+        assert got == fixture.files_sha256, f"{fixture.name}: files_sha256 {got} is not the pinned one"
+    shutil.rmtree(fixture.folder, ignore_errors=True)
+    part.replace(fixture.folder)
+
+
+def dcm2niix_nifti(fixture: DicomFixture, out_dir: Path) -> Path:
+    """dcm2niix's NIfTI-1 (uncompressed) and JSON sidecar of the series; it must make exactly one image."""
+    assert DCM2NIIX.exists(), f"{DCM2NIIX} is missing: run `uv sync` in tools/"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("*"):
+        old.unlink()
+    result = subprocess.run(
+        [str(DCM2NIIX), "-z", "n", "-b", "y", "-f", "%s", "-o", str(out_dir), str(fixture.folder)],
+        capture_output=True, text=True, check=True,
+    )
+    assert DCM2NIIX_VERSION in result.stdout, result.stdout[:200]
+    images = sorted(out_dir.glob("*.nii"))
+    assert len(images) == 1, f"{fixture.name}: dcm2niix wrote {[p.name for p in images]}\n{result.stdout}"
+    return images[0]
+
+
+def same_image(a: Path, b: Path) -> bool:
+    """The parts of two NIfTI files that nibabel's loaded image exposes: voxels, dtype, affine, zooms, scaling."""
+    ia, ib = nib.load(a), nib.load(b)
+    ha, hb = raw_header(a), raw_header(b)
+    return (
+        ia.shape == ib.shape
+        and ia.get_data_dtype() == ib.get_data_dtype()
+        and np.array_equal(ia.affine, ib.affine)
+        and ia.header.get_zooms() == ib.header.get_zooms()
+        and all(np.array_equal(ha[k], hb[k], equal_nan=True) for k in ("scl_slope", "scl_inter"))
+        and np.array_equal(np.asanyarray(ia.dataobj.get_unscaled()), np.asanyarray(ib.dataobj.get_unscaled()))
+    )
+
+
+def dcm2niix_fixture(fixture: DicomFixture) -> Fixture:
+    """The [[scan]] holding dcm2niix's NIfTI of a series, gzipped with a fixed header (stable bytes)."""
+
+    def build(dest: Path):
+        fetch_dicom(fixture)
+        with tempfile.TemporaryDirectory() as tmp:
+            nii = dcm2niix_nifti(fixture, Path(tmp))
+            sidecar = REFERENCE_DICOM / fixture.name / "dcm2niix.json"
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(nii.with_suffix(".json"), sidecar)
+            # nibabel picks the format from the name, so the temporary file keeps the .nii.gz ending
+            part = dest.with_name(f".part-{dest.name}")
+            with part.open("wb") as fh, gzip.GzipFile(filename="", mode="wb", fileobj=fh, mtime=0) as gz:
+                gz.write(nii.read_bytes())
+            assert same_image(nii, part)
+            part.replace(dest)
+        assert_3d_nifti1(dest)
+
+    source = f"dcm2niix {DCM2NIIX_VERSION} (-z n) of dicom/{fixture.name}, from {fixture.source}"
+    return Fixture(fixture.name, "dcm2niix", fixture.modality, source, fixture.license, fixture.notes, build)
+
+
+REFERENCE_DICOM = FIXTURES / "reference" / "dicom"
+NEUROLABUSC = "neurolabusc"
+
+QA = "neurolabusc/dcm_qa"
+MPRAGE = (f"{QA}_mprage", "01f876ffb29461c2e65702856cfe10c8c8534cd9")
+GE = (f"{QA}_ge", "e92133ae414e2b23e8c4d07a4030ab4dbb41518e")
+PHILIPS = (f"{QA}_philips_enh", "31426f16861bab6af7b23d15638a190749041a3e")
+UIH = (f"{QA}_uih", "f3bd991a98eaf49a6f928f276a41f666d658a64b")
+DECUBITUS = (f"{QA}_decubitus", "92cd635dc0a8f971d0e1d4e4ce69efff70fdc04e")
+XA30 = (f"{QA}_xa30i", "699b8c5f6a10efa5e563435d2ce515a511a1e965")
+FRAG = (f"{QA}_frag", "8d102ee4545e248f40d0db81024297cefac1e9c9")
+PDT2 = (f"{QA}_pdt2", "ae6013ba4d8613fb28050055344e53d3325447cf")
+TS = (f"{QA}_ts", "5ea2cf0c48e04a943b9473ced7db701bc4ae57d8")
+
+
+def dicom(name, at, path, unpack, sha, manufacturer, modality, kind, notes, **kw) -> DicomFixture:
+    return DicomFixture(name, at[0], at[1], path, unpack, sha, manufacturer, modality, kind, notes, **kw)
+
+
+DICOM_SET: list[DicomFixture] = [
+    dicom(
+        "dcm-siemens-mprage-sag", MPRAGE, "In/6_T1_mprage_ns_sag_p2.zip", "zip",
+        "324870c3ae6d715feb908362fbce897137cd719adab458e0fb10a7c198c34ccd",
+        "Siemens", "T1w", "series",
+        "Siemens Prisma VE11 3-D sagittal MPRAGE, 1 mm, 192 slices, slightly oblique: reoriented like any 3-D "
+        "acquisition (nii_setOrtho)", scan="dcm-siemens-mprage-sag",
+    ),
+    dicom(
+        "dcm-ge-mprage-ax", GE, "In/05_3D_Ax_T1_MP_RAGE_R22", "files",
+        "f737ca09be1b08b2df54d60b4bdb4aab00c66deef55e17e9f268e5549bd555fe",
+        "GE", "T1w", "series",
+        "GE 3-D axial MPRAGE, 0.94 x 0.94 x 1.2 mm, oblique in two axes; file names out of instance order",
+        scan="dcm-ge-mprage-ax",
+    ),
+    dicom(
+        "dcm-philips-mprage-sag", PHILIPS, "In/cl/1301_", "gz",
+        "4f7a8bdefb044974178924928aa58819724c6f438df9167c6c140f4447bb6546",
+        "Philips", "T1w", "series",
+        "Philips classic 3-D sagittal MPRAGE (ADNI), 170 slices; Philips precise-value scaling (ScaleSlope)",
+        scan="dcm-philips-mprage-sag",
+    ),
+    dicom(
+        "dcm-uih-t1-sag", UIH, "In/DTI_132225/t1_gre_fsp_3d_sag__132750", "files",
+        "0f33b3d8fc6c179ea1baa55bb2377635521636ab7cee833cdbb484d5e8e83e0a",
+        "UIH", "T1w", "series",
+        "United Imaging 3-D sagittal T1, 1 x 0.5 x 0.5 mm (anti-alias smoothing in-plane), uint16",
+        scan="dcm-uih-t1-sag",
+    ),
+    *[
+        dicom(
+            f"dcm-siemens-t1-2d-{position.lower()}", DECUBITUS, f"In/{position}/{series}", "files", sha,
+            "Siemens", "T1w", "series",
+            f"Siemens 2-D sagittal T1 FLASH, 35 slices of 4 mm every 4.8 mm, patient position {position}: rows "
+            "flipped (nii_flipY), the sform's measured 4.799995 mm spacing next to pixdim's 4.8",
+            scan=f"dcm-siemens-t1-2d-{position.lower()}",
+        )
+        for position, series, sha in [
+            ("HFS", "3_t1_fl2d_sag", "a462a9d43d11b9f2a7a152205046d522671d965e2669d6d6c15388aa9e738a18"),
+            ("HFP", "2_t1_fl2d_sag", "57d1802c2ea54fe954041d6efd196b7375ea5dafc4dc2cd1c03e657c5e5c039d"),
+            ("HFDL", "2_t1_fl2d_sag", "205e45f4dde3df19911367fc5e609e3bddc8dd9c64174790a70930da52e77526"),
+            ("HFDR", "2_t1_fl2d_sag", "145b8e559509a58525340b0e134fa19930fc18c0c31eaf9f97349a7affbcc388"),
+        ]
+    ],
+    dicom(
+        "dcm-siemens-xa30-t1w", XA30, "In/5001_anat-T1w_acq-tfl", "gz",
+        "17bd356dfea6e465f102a91ff72deaf3ffee2cf624f090893df8606b4350ae6a",
+        "Siemens", "T1w", "series",
+        "Siemens XA30 classic (interoperability) 3-D T1w, 128 x 128 x 96", scan="dcm-siemens-xa30-t1w",
+    ),
+    dicom(
+        "dcm-siemens-xa30-jpegll", FRAG, "In/5001_anat-T1w_acq-tfl", "files",
+        "a40a4d404db2a147cd4813356d984e07549fd91ceb075ec22b9eb9d69844f62d",
+        "Siemens", "T1w", "series",
+        "the dcm-siemens-xa30-t1w series recompressed as JPEG lossless, each slice split over several fragments; "
+        "converts to the same image", scan="dcm-siemens-xa30-t1w",
+    ),
+    dicom(
+        "dcm-siemens-xa30-t1w-j2k", FRAG, "In/6001_anat-T1w_acq-tfl", "files",
+        "0aa571d5a9216c292f8e5c0ddb749f5be3ff784f846990e727fe852e4d82163c",
+        "Siemens", "T1w", "series",
+        "Siemens XA30 3-D T1w recompressed as JPEG 2000 lossless in several fragments per slice (uint16)",
+        scan="dcm-siemens-xa30-t1w-j2k",
+    ),
+    dicom(
+        "dcm-siemens-xa30-bold", XA30, "In/7001_func-bold_task-fa_run-1", "gz",
+        "32f257f2e0931e39c7053f70527bf90b37330c8f07c494f04739d451ee0189f1",
+        "Siemens", "BOLD", "series",
+        "one 2-D EPI volume (64 x 64 x 33, 3.5 mm) saved as its own series: the echo-planar path (rows flipped)",
+        scan="dcm-siemens-xa30-bold",
+    ),
+    dicom(
+        "dcm-siemens-pdt2", PDT2, "In/Siemens/VE11", "files",
+        "c8c3c6ae1855775917a48a696da6cfbac8112073178cd3e229db9bae3f8750b3",
+        "Siemens", "PD/T2", "refuse",
+        "dual-echo PD/T2 in one series (dcm2niix writes _e1 and _e2): refused", refuse="more than one echo",
+    ),
+    dicom(
+        "dcm-siemens-xa30-scout", XA30, "In/2001_AAHead_Scout", "gz",
+        "6ed6340110c9f83dd51938c8fcc2fbb3973ec90ceb9cdf686664aeb14a96f9f0",
+        "Siemens", "localizer", "refuse",
+        "MPR localizer slices in three orientations in one series: refused", refuse="different orientations",
+    ),
+    dicom(
+        "dcm-transfer-syntaxes", TS, "In", "files",
+        "43ea40ef2c2c3afedf210a491c167bd9c629cbf0ebb7d0c0467279542df7523e",
+        "Siemens", "BOLD", "pixels",
+        "one Siemens mosaic saved in nine transfer syntaxes (explicit and implicit VR little endian, big endian, "
+        "RLE, JPEG lossless, JPEG-LS, JPEG 2000): every decoder gives the same samples; JPEG-LS is refused",
+        unsupported=("1.2.840.10008.1.2.4.80", "1.2.840.10008.1.2.4.81"),
+    ),
+]
+
+# ---------------------------------------------------------------------------------------------------------
 # the fixture set
 
 FIXTURE_SET: list[Fixture] = [
@@ -510,6 +825,8 @@ FIXTURE_SET: list[Fixture] = [
         "2 mm low resolution float64: the 2 mm mask resample is an identity; z center lands on a .5 tie",
         make_2mm,
     ),
+    # dcm2niix's NIfTI of each DICOM series (one per [[dicom]] that names itself as its scan)
+    *[dcm2niix_fixture(d) for d in DICOM_SET if d.kind == "series" and d.scan == d.name],
 ]
 
 
@@ -546,9 +863,47 @@ def pair_entry(pair: Pair) -> list[str]:
     return ["[[pair]]", *(f"{k} = {toml_value(v)}" for k, v in fields.items()), ""]
 
 
+def dicom_entry(fixture: DicomFixture) -> list[str]:
+    fields = {
+        "name": fixture.name,
+        "folder": fixture.folder.relative_to(FIXTURES).as_posix(),
+        "kind": fixture.kind,
+        "source": fixture.source,
+        "license": fixture.license,
+        "manufacturer": fixture.manufacturer,
+        "modality": fixture.modality,
+        "files": sum(1 for p in fixture.folder.rglob("*") if p.is_file()),
+        "files_sha256": fixture.files_sha256,
+    }
+    if fixture.scan:
+        fields["scan"] = fixture.scan
+    if fixture.refuse:
+        fields["refuse"] = fixture.refuse
+    if fixture.unsupported:
+        fields["unsupported"] = list(fixture.unsupported)
+    fields["notes"] = fixture.notes
+    return ["[[dicom]]", *(f"{k} = {toml_value(v)}" for k, v in fields.items()), ""]
+
+
+def check_same_conversions() -> None:
+    """A series whose [[scan]] is another series' dcm2niix NIfTI must convert to that same image."""
+    for fixture in DICOM_SET:
+        if fixture.kind != "series" or fixture.scan == fixture.name:
+            continue
+        fetch_dicom(fixture)
+        with tempfile.TemporaryDirectory() as tmp:
+            nii = dcm2niix_nifti(fixture, Path(tmp))
+            assert same_image(nii, SCANS / f"{fixture.scan}.nii.gz"), f"{fixture.name}: not the image of {fixture.scan}"
+            sidecar = REFERENCE_DICOM / fixture.name / "dcm2niix.json"
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(nii.with_suffix(".json"), sidecar)
+
+
 def raw_header(path: Path) -> nib.Nifti1Header:
     """The header fields exactly as stored (a loaded image's header has scl_slope/scl_inter reset)."""
-    with gzip.open(path, "rb") as f:
+    with path.open("rb") as raw:
+        gzipped = raw.read(2) == b"\x1f\x8b"
+    with (gzip.open(path, "rb") if gzipped else path.open("rb")) as f:
         return nib.Nifti1Header.from_fileobj(f)
 
 
@@ -591,6 +946,8 @@ def write_manifest(fixtures: list[Fixture]) -> None:
         "# file is relative to this directory. zooms are the affine's column norms (what nibabel resamples",
         "# with); scl_slope = nan or 0 means unscaled. encode lists the models with an encode reference.",
         "# A [[pair]] is a target scan prepared on a reference scan's head mask and grid (prepare_images).",
+        "# A [[dicom]] is a DICOM series under folder: kind series converts to the [[scan]] named scan (dcm2niix's",
+        "# NIfTI of it), refuse is refused with a message containing refuse, pixels decodes to the same samples.",
         "",
     ]
     for fixture in fixtures:
@@ -599,19 +956,25 @@ def write_manifest(fixtures: list[Fixture]) -> None:
     for pair in PAIRS:
         assert {pair.target, pair.reference} <= names, pair
         lines += pair_entry(pair)
+    for fixture in DICOM_SET:
+        assert fixture.scan is None or fixture.scan in names, fixture
+        lines += dicom_entry(fixture)
     MANIFEST.write_text("\n".join(lines))
-    print(f"wrote {MANIFEST} ({len(fixtures)} scans, {len(PAIRS)} pairs)")
+    print(f"wrote {MANIFEST} ({len(fixtures)} scans, {len(PAIRS)} pairs, {len(DICOM_SET)} DICOM sets)")
 
 
 def check_manifest() -> None:
     import tomllib
 
-    scans = tomllib.loads(MANIFEST.read_text())["scan"]
+    manifest = tomllib.loads(MANIFEST.read_text())
+    scans = manifest["scan"]
     for scan in scans:
         path = FIXTURES / scan["file"]
         assert sha256_file(path) == scan["sha256"], f"{scan['name']}: sha256 mismatch"
         assert_3d_nifti1(path)
-    print(f"{len(scans)} scans match {MANIFEST}")
+    for entry in manifest.get("dicom", []):
+        assert files_sha256(FIXTURES / entry["folder"]) == entry["files_sha256"], f"{entry['name']}: files differ"
+    print(f"{len(scans)} scans and {len(manifest.get('dicom', []))} DICOM sets match {MANIFEST}")
 
 
 def main():
@@ -625,18 +988,23 @@ def main():
         return
 
     SCANS.mkdir(parents=True, exist_ok=True)
-    unknown = set(args.names) - {f.name for f in FIXTURE_SET}
+    unknown = set(args.names) - {f.name for f in FIXTURE_SET} - {d.name for d in DICOM_SET}
     assert not unknown, f"unknown fixtures {sorted(unknown)}"
+    for fixture in DICOM_SET:
+        if not args.names or fixture.name in args.names:
+            fetch_dicom(fixture)
     for fixture in FIXTURE_SET:
         if args.names and fixture.name not in args.names:
             continue
-        if fixture.kind == "synthetic" and fixture.path.exists() and not (args.force or args.names):
+        # built files are kept (their sha256 stays stable) unless rebuilt on purpose
+        if fixture.kind in ("synthetic", "dcm2niix") and fixture.path.exists() and not (args.force or args.names):
             continue
         t0 = time.perf_counter()
         fixture.build(fixture.path)
         print(f"{fixture.name}: {fixture.path.stat().st_size / 1e6:.1f} MB, {time.perf_counter() - t0:.1f}s")
     missing = [f.name for f in FIXTURE_SET if not f.path.exists()]
     assert not missing, f"missing fixtures {missing}"
+    check_same_conversions()
     write_manifest(FIXTURE_SET)
 
 

@@ -20,13 +20,13 @@ use larmor_volume::{Affine, Nifti, VoxelData};
 use crate::cache::CacheEntry;
 use crate::console::{bold, dim, green, red, secs, with_ci, yellow};
 use crate::device;
-use crate::encode_cmd::{check_reference, prepare_again};
-use crate::hashing::sha256_file;
+use crate::encode_cmd::{prepare_again, resolve_reference};
 use crate::labels::{LabelColumn, LabelRow, LabelTable};
 use crate::locate;
 use crate::model::Model;
 use crate::outputs::{self, ScanOutputs, check_unique_outputs, tsv_cell};
 use crate::pipeline::{Pipeline, ScanResult, reference_key};
+use crate::scan::Scan;
 use crate::seg_labels::{assemble_patches, labels_on_grid, patch_rows};
 
 /// `--kind`.
@@ -205,8 +205,10 @@ fn chosen(probe: &Probe) -> String {
     parts.join(", ")
 }
 
-/// A label row's scan and reference, hashed.
+/// A label row's scan and reference, resolved and hashed.
 struct RowKey {
+    scan: Scan,
+    reference: Option<Scan>,
     scan_sha256: String,
     reference_sha256: Option<String>,
 }
@@ -230,9 +232,12 @@ fn cached_entries(
     let model = pipeline.model();
     let mut keys = Vec::with_capacity(column.rows.len());
     for row in &column.rows {
-        let hash = |path: &Path| sha256_file(path).with_context(|| format!("reading {}", path.display()));
-        let reference_sha256 = row.reference.as_deref().map(hash).transpose()?;
-        keys.push(RowKey { scan_sha256: hash(&row.scan)?, reference_sha256 });
+        let at_line = || format!("{} line {}", table.path.display(), row.line);
+        let scan = Scan::resolve(&row.scan).with_context(at_line)?;
+        let reference = row.reference.as_deref().map(Scan::resolve).transpose().with_context(at_line)?;
+        let scan_sha256 = scan.sha256().with_context(at_line)?;
+        let reference_sha256 = reference.as_ref().map(Scan::sha256).transpose().with_context(at_line)?;
+        keys.push(RowKey { scan, reference, scan_sha256, reference_sha256 });
     }
     check_duplicates(&table.path, &column.rows, &keys, column.folds.as_deref())?;
 
@@ -282,18 +287,13 @@ fn cached_entries(
         );
     }
     let mut out = Vec::with_capacity(entries.len());
-    for (row, entry) in column.rows.iter().zip(entries) {
+    for (key, entry) in keys.iter().zip(entries) {
         let entry = match entry {
             Some(entry) => entry,
             // re-encodes an unreadable entry too
             None => {
-                let entry = pipeline.run(&row.scan, row.reference.as_deref(), with_tokens)?.entry;
-                println!(
-                    "  {} {}  {} tokens",
-                    green("encoded"),
-                    locate::scan_stem(&row.scan),
-                    entry.info.tokens
-                );
+                let entry = pipeline.run(&key.scan, key.reference.as_ref(), with_tokens)?.entry;
+                println!("  {} {}  {} tokens", green("encoded"), key.scan.stem(), entry.info.tokens);
                 entry
             }
         };
@@ -444,13 +444,11 @@ pub fn cmd_probe_apply(options: ApplyOptions) -> Result<()> {
             model.path.display()
         )
     })?;
-    if let Some(reference) = &options.reference {
-        check_reference(reference)?;
-    }
+    let reference = options.reference.as_deref().map(resolve_reference).transpose()?;
     let found = locate::find_scans(&options.inputs, options.out.as_slice())?;
     let scans = found.scans;
     if scans.is_empty() {
-        bail!("no .nii or .nii.gz scans found");
+        bail!("no .nii, .nii.gz or DICOM scans found");
     }
     let name = probe_name(&options.probe, &probe);
     let mut pipeline = Pipeline::new(&model, options.device, options.precision, locate::cache_root()?);
@@ -473,7 +471,7 @@ pub fn cmd_probe_apply(options: ApplyOptions) -> Result<()> {
             pipeline.precision()
         );
     }
-    let scans = Scans { paths: &scans, root: found.root.as_deref(), reference: options.reference.as_deref() };
+    let scans = Scans { paths: &scans, root: found.root.as_deref(), reference: reference.as_ref() };
     let failed = match meta.kind {
         ProbeKind::Regression | ProbeKind::Classification => {
             apply_scan_level(&probe, &name, &scans, &mut pipeline, options.out.as_deref())?
@@ -490,10 +488,10 @@ pub fn cmd_probe_apply(options: ApplyOptions) -> Result<()> {
 
 /// The scans `probe apply` predicts on.
 struct Scans<'a> {
-    paths: &'a [PathBuf],
+    paths: &'a [Scan],
     /// The inputs' common folder, for output paths.
     root: Option<&'a Path>,
-    reference: Option<&'a Path>,
+    reference: Option<&'a Scan>,
 }
 
 /// The name used in output files: the probe file's stem, or its label column when the file is just
@@ -525,7 +523,7 @@ fn apply_scan_level(
         (ProbeKind::Classification, _) => bail!("the probe's label_names do not name its two classes"),
         _ => None,
     };
-    let mut done: Vec<&PathBuf> = Vec::with_capacity(scans.paths.len());
+    let mut done: Vec<&Scan> = Vec::with_capacity(scans.paths.len());
     let mut pooled = Vec::with_capacity(scans.paths.len());
     let mut failed = 0;
     for scan in scans.paths {
@@ -535,7 +533,7 @@ fn apply_scan_level(
                 pooled.push(result.entry.pooled);
             }
             Err(err) => {
-                println!("  {} {}  {err:#}", red("failed "), locate::scan_stem(scan));
+                println!("  {} {}  {err:#}", red("failed "), scan.stem());
                 failed += 1;
             }
         }
@@ -550,21 +548,22 @@ fn apply_scan_level(
         "scan\tprediction\n"
     });
     for (scan, &value) in done.iter().zip(&predictions) {
-        let shown = tsv_cell(&scan.display().to_string());
+        let shown = tsv_cell(&scan.path().display().to_string());
         match classes {
             Some((negative, positive)) => {
                 // sklearn's predict: the positive class when its probability is above 0.5
                 let class = if value > 0.5 { positive } else { negative };
-                println!("  {}  {}  p = {value:.4}", locate::scan_stem(scan), bold(class));
+                println!("  {}  {}  p = {value:.4}", scan.stem(), bold(class));
                 let _ = writeln!(tsv, "{shown}\t{}\t{value}", tsv_cell(class));
             }
             None => {
-                println!("  {}  {}", locate::scan_stem(scan), bold(&format!("{value:.4}")));
+                println!("  {}  {}", scan.stem(), bold(&format!("{value:.4}")));
                 let _ = writeln!(tsv, "{shown}\t{value}");
             }
         }
     }
-    let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(&scans.paths[0]));
+    let out_root =
+        out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(scans.paths[0].path()));
     let path = out_root.join(format!("{name}_predictions.tsv"));
     outputs::write_atomic(&path, tsv.as_bytes())?;
     println!("{} wrote {}", green("✓"), path.display());
@@ -587,7 +586,7 @@ fn apply_segmentation(
         .paths
         .iter()
         .map(|scan| {
-            let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(scan));
+            let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| locate::default_out_dir(scan.path()));
             let outputs = ScanOutputs::new(&out_root, scan, scans.root);
             (out_root, outputs)
         })
@@ -596,7 +595,7 @@ fn apply_segmentation(
         .paths
         .iter()
         .zip(&destinations)
-        .map(|(scan, (_, o))| (scan.as_path(), o.probe_mask(name)))
+        .map(|(scan, (_, o))| (scan.path(), o.probe_mask(name)))
         .collect();
     check_unique_outputs(&targets)?;
 
@@ -607,12 +606,12 @@ fn apply_segmentation(
         match result {
             Ok((mask_ml, threshold)) => println!(
                 "  {}  {mask_ml:.1} ml at threshold {threshold:.4} · {} · {}",
-                locate::scan_stem(scan),
+                scan.stem(),
                 secs(start.elapsed().as_secs_f64()),
                 dim(&outputs.probe_mask(name).display().to_string())
             ),
             Err(err) => {
-                println!("  {} {}  {err:#}", red("failed "), locate::scan_stem(scan));
+                println!("  {} {}  {err:#}", red("failed "), scan.stem());
                 failed += 1;
             }
         }
@@ -625,8 +624,8 @@ fn apply_segmentation(
 fn segment_one(
     probe: &Probe,
     name: &str,
-    scan: &Path,
-    reference: Option<&Path>,
+    scan: &Scan,
+    reference: Option<&Scan>,
     pipeline: &mut Pipeline,
     device: &larmor_probe::Device,
     out_root: &Path,

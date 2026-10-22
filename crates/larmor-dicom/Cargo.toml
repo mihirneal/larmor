@@ -1,0 +1,25 @@
+[package]
+name = "larmor-dicom"
+description = "DICOM series to the NIfTI image dcm2niix writes, on dicom-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+larmor-volume = { path = "../larmor-volume" }
+thiserror.workspace = true
+rayon.workspace = true
+sha2 = "0.11.0"
+dicom-core = "0.10.0"
+dicom-dictionary-std = "0.10.0"
+dicom-object = "0.10.0"
+dicom-encoding = "0.10.0"
+dicom-transfer-syntax-registry = { version = "0.10.0", default-features = false }
+# Decoders in pure Rust: JPEG baseline/extended/lossless, RLE and deflate ("native"), JPEG 2000
+# ("openjp2"). JPEG-LS would need the CharLS C++ library and is not built.
+dicom-pixeldata = { version = "0.10.0", default-features = false, features = ["native", "openjp2", "rayon"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+toml.workspace = true

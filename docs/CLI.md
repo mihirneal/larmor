@@ -1,7 +1,7 @@
 # The `larmor` command line
 
-`larmor` turns MRI scans into foundation-model embeddings and fits and applies linear probes on them.
-This page lists every command, its flags and what it writes. `docs/DESIGN.md` is the contract behind it
+`larmor` turns MRI scans (NIfTI files or DICOM series) into foundation-model embeddings and fits and
+applies linear probes on them. This page lists every command, its flags and what it writes. `docs/DESIGN.md` is the contract behind it
 (recipe, cache, formats, gates).
 
 ```sh
@@ -36,36 +36,65 @@ Model ids are looked up in `$LARMOR_MODELS`, then the user data folder
 
 ## `larmor encode <scan or folder>... --model ID`
 
-Preprocesses and encodes scans, caches their embeddings and writes BIDS derivatives.
+Preprocesses and encodes scans (NIfTI files and DICOM series), caches their embeddings and writes BIDS
+derivatives.
 
 | Flag | |
 |---|---|
 | `--out DIR` | Derivatives folder. Default: `<BIDS root>/derivatives/larmor` when the scan is inside a BIDS dataset (a folder up the tree has `dataset_description.json`), else `./derivatives/larmor` |
-| `--reference SCAN` | Prepare every scan on this scan's head mask and grid (below) |
+| `--reference SCAN` | Prepare every scan on this scan's head mask and grid (below); a NIfTI file or a DICOM series' folder |
 | `--device`, `--precision` | As above |
 | `--force` | Encode again even when the cache has the embedding, and replace outputs that another scan wrote (below) |
 | `--save-preprocessed` | Also write the quantized model-grid image and its head mask |
 
 Inputs are `.nii` / `.nii.gz` files (single-file NIfTI-1 or NIfTI-2 with integer or real float data) or
-folders. Two-file images (`.hdr`/`.img`), Analyze 7.5, compressed variants other than gzip (`.nii.bz2`,
-`.nii.zst`), FreeSurfer `.mgz` and complex or RGB data are not read: convert them to `.nii.gz` (complex
-data to a real magnitude image first). Folders are searched recursively, skipping:
+folders, which are searched for NIfTI files and DICOM series. Two-file images (`.hdr`/`.img`), Analyze 7.5,
+compressed variants other than gzip (`.nii.bz2`, `.nii.zst`), FreeSurfer `.mgz` and complex or RGB data are
+not read: convert them to `.nii.gz` (complex data to a real magnitude image first). Folders are searched
+recursively, skipping:
 
-- hidden folders, `derivatives/`, the run's `--out` folder and any folder whose `dataset_description.json`
-  says `"DatasetType": "derivative"`;
-- inside a BIDS dataset, the non-anatomical datatype folders `func/`, `dwi/`, `fmap/`, `perf/`, `pet/`,
-  `meg/`, `eeg/`, `ieeg/`, `beh/`, `micr/`, `nirs/`, `motion/` and `mrs/` (name such a folder, or a file in
-  it, to include it);
+- hidden files and folders, names of files still being written or synced (`.part`, `.partial`, `.tmp`,
+  `.download`, `.crdownload`, `~$…`), `derivatives/`, the run's `--out` folder and any folder whose
+  `dataset_description.json` says `"DatasetType": "derivative"`;
+- inside a BIDS dataset, `sourcedata/` (what the dataset was converted from, often DICOM) and the
+  non-anatomical datatype folders `func/`, `dwi/`, `fmap/`, `perf/`, `pet/`, `meg/`, `eeg/`, `ieeg/`,
+  `beh/`, `micr/`, `nirs/`, `motion/` and `mrs/` (name such a folder, or a file in it, to include it);
 - label images (BIDS suffixes `_mask`, `_dseg`, `_probseg`, `_roi`, `_defacemask`) and larmor's own grid
   images (`_model-<id>_desc-quantized`);
-- images whose header (read alone, without the voxels) is not 3-D, such as 4-D fMRI or DWI series.
+- images whose header (read alone, without the voxels) is not 3-D, such as 4-D fMRI or DWI series;
+- DICOM series that are not one 3-D volume (below), each listed with the reason.
 
 A note on stderr lists what was skipped (and files in the formats above). A file named on the command line
 is always used; a 4-D one fails with an error that says so, before its voxels are read.
 
-For each scan: SHA-256 of the file bytes, then the cache key (scan SHA-256, the reference scan's SHA-256 with
-`--reference`, preprocessing version, encoder key, precision; see "Cache entries"). On a cache hit nothing is
-computed; on a miss the scan is read, preprocessed with the model's recipe, cut into in-mask patch tokens,
+### DICOM series
+
+A DICOM series is read from its files, wherever they are below the folder searched: files that start like
+DICOM Part 10 (`DICM` after the 128-byte preamble; names ending in `.json`, `.txt`, `.png` and other
+non-DICOM extensions are not opened) are grouped by SeriesInstanceUID from their headers alone, and each
+series becomes one scan. It is converted to exactly the NIfTI image dcm2niix v1.0.20260724 writes for it
+(with its default options) as nibabel loads it: the same voxels and dtype, sform, header zooms and scale
+factors (`docs/DESIGN.md`, "DICOM input"). Its embedding is then the one `larmor encode` gives that NIfTI
+file, bit for bit. Read: classic DICOM (one slice per file) in any transfer syntax larmor decodes
+(uncompressed little or big endian, deflate, RLE, JPEG baseline, extended and lossless, JPEG 2000),
+including slices whose InstanceNumber order is not spatial and copies of the same file. Refused, with the
+reason: enhanced (multi-frame) files, Siemens mosaics, colour images, JPEG-LS, localizers and other series
+whose slices differ in orientation, size or sample format, 4-D series (repeated slice positions), several
+echoes in one series, slice spacing that varies (missing slices), gantry tilt, Philips series whose
+scaling varies between slices, and single slices. Name a series by its folder; a single DICOM file is
+refused (it is one slice).
+
+A series' outputs are named after its folder: `exam/T1_MPRAGE/*.dcm` gives `T1_MPRAGE_model-<id>_…` in the
+mirror of `exam/`, exactly as a file `exam/T1_MPRAGE.nii.gz` would. Series that share a folder (a flat
+export) get `<folder>_series-<SeriesNumber>_model-<id>_…` in the mirror of that folder. The series'
+SHA-256 (in `run.json` and the cache key) is computed from its files' contents, so renaming or moving the
+files keeps the cached embedding.
+
+For each scan: SHA-256 of the file bytes (of a DICOM series: of its files' SHA-256s, sorted, and the DICOM
+conversion's version), then the cache key (scan SHA-256, the reference scan's SHA-256 with `--reference`,
+preprocessing version, encoder key, precision; see "Cache entries"). On a cache hit nothing is computed
+(a DICOM series is not even decoded); on a miss the scan is read (a DICOM series converted), preprocessed
+with the model's recipe, cut into in-mask patch tokens,
 encoded and cached. The encoder is loaded only when some scan is not cached, and while it encodes one scan
 the next is read and preprocessed on another thread. One status line per scan, then a summary:
 
@@ -86,8 +115,9 @@ printed once, with what to do, and the remaining uncached scans fail without loa
 
 nanobrain's eval framework prepares some modalities on another one's head mask: `prepare_images(images,
 segs, reference="flair")` computes one head mask from the FLAIR and conforms and quantizes ADC and DWI with
-that mask and the FLAIR's grid (FOMO tasks 1 and 2). `--reference SCAN` does the same for every scan of the
-run: the head mask comes from `SCAN`, each scan is conformed with it, its grid must agree with the
+that mask and the FLAIR's grid (FOMO tasks 1 and 2). `--reference SCAN` (a NIfTI file, or a DICOM series'
+folder) does the same for every scan of the run: the head mask comes from `SCAN`, each scan is conformed
+with it, its grid must agree with the
 reference's to 1e-3 mm (the eval framework's assertion; a scan on another voxel grid fails), and it is
 quantized and normalised inside the reference's grid mask. The scan's embedding then differs from the one
 it gets on its own mask, and is cached under its own key. Encode one subject at a time this way
@@ -137,7 +167,7 @@ belongs to another scan (another path and other bytes: a second run with the sam
 | `larmor_version` | |
 | `model` | `id`, weights `sha256`, `encoder_key` (the encoder part of the cache key), `manifest` path, `family`, `patch`, `width`, `depth` |
 | `preprocessing` | `version` (the cache-key hash), `impl_version`, every `steps` value |
-| `scan` | absolute `path`, `sha256`, `shape`, `zooms`, `orientation` (axis codes), stored `dtype`, `affine` |
+| `scan` | absolute `path` (the NIfTI file, or the DICOM series' folder), `sha256` (of the file; of a DICOM series, its files' SHA-256s sorted, with the conversion's version), `shape`, `zooms`, `orientation` (axis codes), stored `dtype`, `affine`; for a DICOM series also `dicom`: `series_instance_uid`, `series_number`, `series_description`, `protocol_name`, `modality`, `manufacturer`, `slices`, `transfer_syntaxes`, `conversion` (`larmor-dicom <version> (dcm2niix v1.0.20260724)`) |
 | `grid` | `shape`, `fit_affine` (maps native labels onto the grid), `centroid`, anti-alias `fwhm`, `patch` |
 | `vmin`, `vmax` | quantization window (in-mask 0.5% and 99.5% quantiles) |
 | `head_volume_ml` | native-space head mask volume |
@@ -203,7 +233,7 @@ all scans.
 
 `labels.tsv` (annotated example: `examples/labels.tsv`): tab-separated, one row per scan; `#` lines are
 comments, and a UTF-8 byte order mark (spreadsheet exports) is ignored. `scan` is a path relative to the
-TSV. Other columns are labels; empty and `n/a` cells are missing and their rows are left out. An optional
+TSV: a NIfTI file, or a folder holding exactly one scan (a DICOM series' folder). Other columns are labels; empty and `n/a` cells are missing and their rows are left out. An optional
 `fold` column (0-based) fixes the outer folds; without it the folds are the eval framework's (KFold(5) or
 StratifiedKFold(5), shuffled with seed 0). An optional `reference` column names, per row, the scan whose
 head mask and grid that row's scan is prepared on (as `encode --reference`).
@@ -259,13 +289,57 @@ failed.
   the probability is above 0.5) and prints the predictions.
 * **segmentation**: per scan, voxel probabilities on the model grid, thresholded at the probe's
   threshold (`p >= t`), mapped back to the scan's voxels with nearest neighbour (the recipe is re-run,
-  about 0.1 s) and written as `<stem>_desc-<probe>_mask.nii.gz` (uint8, the scan's header geometry),
+  about 0.1 s) and written as `<stem>_desc-<probe>_mask.nii.gz` (uint8, the scan's header geometry; for
+  a DICOM series, the voxels and header of dcm2niix's NIfTI of it),
   plus the probabilities on the grid as `<stem>_desc-<probe>_probseg.nii.gz` (float32, fit affine).
   Prints the mask volume per scan. Outputs go where `encode` puts them; two scans that would write the
   same mask stop the run before anything is written.
 
 `<probe>` is the probe file's stem (letters and digits only), or the label column when the file is
 `probe.toml`.
+
+## `larmor watch --site site.toml [--once]`
+
+Watches folders and encodes scans as they arrive, like a scanner-side service. The site file
+(annotated example: `examples/site.toml`) lists the `[[source]]` folders, the `[output]` folder, the
+`[encode]` models, device and precision, and the `[watch]` timings:
+
+| Key | Default | |
+|---|---|---|
+| `[[source]] path` | | A folder, searched like `larmor encode <folder>` (NIfTI files and DICOM series). On a Mac, Box Drive files are under `~/Library/CloudStorage/Box-Box/` |
+| `[[source]] name` | the folder's name | The label in the log and the source's output folder; letters, digits, `-`, `_` |
+| `[[source]] out` | `<output dir>/<name>` | Where its derivatives go; outputs mirror each scan's folder below `path` (BIDS `sub-XX/…` paths mirror as for `encode`) |
+| `[output] dir` | | The derivatives root, which also holds the log and the ledger |
+| `[output] log` | `larmor-watch.log` | Relative to `dir` |
+| `[encode] models` | | Model ids, or paths to `model.toml` files (relative to the site file) |
+| `[encode] device`, `precision` | `auto`, `f32` | As for `encode` |
+| `[encode] save_preprocessed` | `false` | As `encode --save-preprocessed` |
+| `[watch] poll_seconds` | `10` | How often the sources are listed |
+| `[watch] settle_seconds` | `60` | How long files must stay unchanged before they are read |
+
+Paths may start with `~` (the home folder); relative paths are relative to the site file. A source and its
+output folder must not contain each other.
+
+The sources are polled, not watched for file events: cloud folders (Box Drive, a File Provider) and
+network shares do not report changes reliably, and listing a folder does not download anything. A file is
+settled once its size and modification time have stayed the same for `settle_seconds` of the watcher's
+own observation (Box Drive gives synced files their original modification times, so a file's age says
+nothing). Only settled files are opened (once each: opening a Box file downloads it). A NIfTI file is
+encoded once it is settled; a DICOM series once every file in its folder is, since a series syncs a file at
+a time (leave room in `settle_seconds` for pauses in the upload). Each scan goes through the cache with
+every model, its outputs are written as `encode` writes them, and series that are not one 3-D volume are
+skipped with the reason.
+
+Every action goes to stdout and is appended, with its time, to the log: the start (sources, models,
+timings), how many files a source holds, new or changed files in a folder ("waiting until they settle"),
+each scan that settled, each encode or cache hit with its tokens, time and output, each failure with its
+error, each skipped series or unreadable file (once), and sources that go missing or come back. The ledger
+(`<output dir>/.larmor-watch.json`) remembers, per scan, the paths, sizes and modification times of its
+files and the models' encoder keys it was done with; a restart skips scans that are unchanged and still
+have their outputs, and encodes again a scan whose files changed (more slices arrived, say), whose outputs
+were removed, or when the site's models change. A scan that failed is tried again only when its files
+change. `--once` lists the sources, waits `settle_seconds`, encodes what stayed unchanged and exits (for
+cron jobs and tests). Stop the watcher with Ctrl-C; every output and the ledger are written atomically.
 
 ## `larmor check-parity <fixtures> [--models ID,...]`
 
@@ -274,9 +348,13 @@ Runs the recipe on every scan in `<fixtures>/manifest.toml` and compares each st
 `reference/encode/<model>/` (manifests in `<fixtures>/models/`) and compares tokens, class tokens and
 the pooled embedding with PyTorch's fp32 output. Each `[[pair]]` of the manifest (a target scan prepared
 on a reference scan's head mask, `prepare_images` with `reference=`) is checked the same way, and its fit
-mask, quantized volume, grid and image affines and token grid must be bit-exact. `--models` restricts the models; `--device` and
-`--precision` choose how to encode. Prints one row per scan and model, then each gate with its worst
-value and the scan it came from, and exits 1 if any gate fails.
+mask, quantized volume, grid and image affines and token grid must be bit-exact. Each `[[dicom]]` series
+is converted and must equal dcm2niix's NIfTI of it (its `[[scan]]`) bit for bit (voxels, dtype, affine,
+zooms, scale factors), then passes that scan's preprocessing and encode gates from the DICOM files;
+refusal sets must be refused with the expected reason, and a transfer-syntax set must decode to the same
+samples in every syntax larmor reads. `--models` restricts the models; `--device` and `--precision`
+choose how to encode. Prints one row per scan and model, then each gate with its worst value and the scan
+it came from, and exits 1 if any gate fails.
 
 | Column / gate | Limit |
 |---|---|
@@ -289,6 +367,9 @@ value and the scan it came from, and exits 1 if any gate fails.
 | 1-ctr min: cosine distance after subtracting the reference's mean token from both sides | reported |
 | 1-pooled: pooled embedding cosine distance | pooled cosine ≥ 0.999 |
 | max abs Δ of the tokens | reported |
+| DICOM to NIfTI bit-exact with dcm2niix | all series |
+| DICOM series refused with the reason | all refusal sets |
+| DICOM decoders agree on every syntax | all transfer-syntax sets |
 
 Also printed: the worst centered cosine and max abs Δ with their scans, the mean encode time, and
 PyTorch's own bf16-vs-fp32 cosines from the reference metadata (the noise floor of the eval framework's
@@ -301,7 +382,7 @@ Per-stage timing on this machine, like `onset timing-test`.
 | Flag | |
 |---|---|
 | `--model ID\|PATH` | Default: `<fixtures>/models/nanobrain-vits-p8-ref.toml`, else the first installed model with verified weights, else random weights in the shape of nanobrain ViT-S (patch 8) |
-| `--scan FILE` | Default: the first scan of `<fixtures>/manifest.toml`, else a built-in synthetic head (176 x 208 x 176 at 1 mm) |
+| `--scan FILE` | A NIfTI file or a DICOM series' folder (its read time includes the conversion). Default: the first scan of `<fixtures>/manifest.toml`, else a built-in synthetic head (176 x 208 x 176 at 1 mm) |
 | `--runs N` | Default 5; the first encode is reported separately as the cold one |
 | `--device`, `--precision` | As above |
 | `--json` | The report as JSON |

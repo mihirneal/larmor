@@ -1,0 +1,35 @@
+# A site for `larmor watch --site site.toml`: the folders scans arrive in, where their embeddings go,
+# and the models that encode them. Copy this file next to your data and edit the paths; nothing here
+# names a real lab folder.
+#
+# Relative paths are relative to this file; `~` is your home folder. Each source is searched like
+# `larmor encode <folder>`: NIfTI files and DICOM series, anywhere below it (hidden folders,
+# derivatives/ and, inside a BIDS dataset, func/, dwi/... and sourcedata/ are skipped).
+
+[[source]]
+# Box Drive puts your Box files under ~/Library/CloudStorage/Box-Box/; point this at the folder the
+# scanner exports land in.
+name = "box"                                             # the label in the log (letters, digits, - or _)
+path = "~/Library/CloudStorage/Box-Box/<lab folder>/scans"
+# out = "~/larmor/box"                                   # default: <output dir>/<name>
+
+# A second source, such as a local export folder:
+# [[source]]
+# name = "scanner"
+# path = "/Volumes/scanner-export"
+
+[output]
+dir = "~/larmor/derivatives"    # each source's BIDS derivatives go to <dir>/<source name>/
+# log = "larmor-watch.log"      # every action, with its time; relative to dir
+
+[encode]
+models = ["nanobrain-vits-p8"]  # model ids (see `larmor models`) or paths to model.toml files
+device = "auto"                 # auto, cpu, metal, cuda or cuda:N
+precision = "f32"               # f32, or f16 / bf16 on a GPU
+save_preprocessed = false       # also write the quantized model-grid image and its head mask
+
+[watch]
+poll_seconds = 10               # how often the sources are listed
+settle_seconds = 60             # a scan is encoded once its files (and, for a DICOM series, every file
+                                # in its folder) have not changed for this long; Box syncs a series a
+                                # file at a time, so leave room for pauses in the upload

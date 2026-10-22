@@ -6,21 +6,22 @@
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
+use larmor_dicom::SeriesInfo;
 use larmor_model::{DeviceChoice, Encoder, EncoderError, ManifestError, Precision};
 use larmor_prep::{Prepared, Tokens};
-use larmor_volume::{Nifti, NiftiHeader};
+use larmor_volume::Nifti;
 
 use crate::cache::{self, CacheEntry, EntryKey};
 use crate::console::{dim, secs, yellow};
-use crate::hashing::sha256_hex;
 use crate::model::Model;
 use crate::run_info::{Encoding, ReferenceInfo, RunInfo, StageSeconds, absolute, now};
+use crate::scan::{ReadScan, Scan};
 
 /// Whether a scan's embedding came from the cache or was computed now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,46 +52,16 @@ pub enum Staged {
 
 /// A preprocessed scan whose embedding is not cached yet.
 pub struct Ready {
-    scan: PathBuf,
+    scan: Scan,
     sha: String,
     reference: Option<ReferenceInfo>,
     cache_path: PathBuf,
     nifti: Nifti,
+    dicom: Option<SeriesInfo>,
     prepared: Prepared,
     tokens: Tokens,
     seconds: StageSeconds,
     started: String,
-}
-
-/// A scan file read into memory and hashed.
-pub struct ReadScan {
-    pub path: PathBuf,
-    pub bytes: Vec<u8>,
-    pub sha256: String,
-}
-
-impl ReadScan {
-    pub fn read(path: &Path) -> Result<ReadScan> {
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let sha256 = sha256_hex(&bytes);
-        Ok(ReadScan { path: path.to_path_buf(), bytes, sha256 })
-    }
-
-    /// The image, after checking from its header alone that it is 3-D (so a 4-D series is refused
-    /// before all of it is decoded).
-    pub fn parse(&self) -> Result<Nifti> {
-        let header = NiftiHeader::from_file_bytes(&self.bytes)
-            .with_context(|| format!("parsing {}", self.path.display()))?;
-        let shape = header.shape();
-        if shape.len() != 3 {
-            bail!(
-                "{}: expected a 3-D image, got shape {shape:?} (a 4-D series such as fMRI or DWI is not an \
-                 anatomical scan; pass a 3-D volume)",
-                self.path.display()
-            );
-        }
-        Nifti::from_bytes(&self.bytes).with_context(|| format!("parsing {}", self.path.display()))
-    }
 }
 
 /// The reference scan's SHA-256 as the cache key needs it: `None` when there is no reference or it
@@ -150,7 +121,7 @@ impl Stager<'_> {
 
     /// [`Stager::stage`], with a panic turned into this scan's error, so a worker thread keeps
     /// going with the next scan.
-    pub fn stage_catching(&self, scan: &Path, reference: Option<&Path>, tokens: bool) -> Result<Staged> {
+    pub fn stage_catching(&self, scan: &Scan, reference: Option<&Scan>, tokens: bool) -> Result<Staged> {
         panic::catch_unwind(AssertUnwindSafe(|| self.stage(scan, reference, tokens))).unwrap_or_else(
             |payload| {
                 Err(anyhow!(
@@ -165,21 +136,18 @@ impl Stager<'_> {
     /// Reads `scan` (and `reference`, the scan whose head mask and grid to use) and either finds its
     /// embedding in the cache (with the patch tokens when `tokens`) or preprocesses it for the
     /// encoder.
-    pub fn stage(&self, scan: &Path, reference: Option<&Path>, tokens: bool) -> Result<Staged> {
+    pub fn stage(&self, scan: &Scan, reference: Option<&Scan>, tokens: bool) -> Result<Staged> {
         let started = now();
         let start = Instant::now();
-        let bytes = std::fs::read(scan).with_context(|| format!("reading {}", scan.display()))?;
-        let reference_bytes = reference
-            .map(|r| std::fs::read(r).with_context(|| format!("reading the reference {}", r.display())))
+        let content = scan.read_content()?;
+        let reference_content = reference
+            .map(|r| r.read_content().with_context(|| format!("reading the reference {}", r.display())))
             .transpose()?;
         let read = start.elapsed().as_secs_f64();
         let start = Instant::now();
-        let target = ReadScan { path: scan.to_path_buf(), sha256: sha256_hex(&bytes), bytes };
-        let reference = reference.zip(reference_bytes).map(|(path, bytes)| ReadScan {
-            path: path.to_path_buf(),
-            sha256: sha256_hex(&bytes),
-            bytes,
-        });
+        let target = ReadScan::new(scan.clone(), content);
+        let reference =
+            reference.zip(reference_content).map(|(r, content)| ReadScan::new(r.clone(), content));
         // a scan that is its own reference is simply the scan
         let reference = reference.filter(|r| r.sha256 != target.sha256);
         let hash = start.elapsed().as_secs_f64();
@@ -207,16 +175,20 @@ impl Stager<'_> {
         }
 
         let start = Instant::now();
-        let nifti = target.parse()?;
-        let reference_nifti = reference.as_ref().map(ReadScan::parse).transpose()?;
+        let parsed = target.parse()?;
+        for note in &parsed.notes {
+            eprintln!("{} {}: {note}", dim("note:"), scan.display());
+        }
+        let reference_nifti = reference.as_ref().map(|r| r.parse().map(|p| p.nifti)).transpose()?;
         let read = read + start.elapsed().as_secs_f64();
+        let nifti = parsed.nifti;
         let prepared = match &reference_nifti {
             None => self.model.recipe.run(&nifti),
             Some(reference_nifti) => self.model.recipe.run_with_reference(&nifti, reference_nifti),
         };
         let prepared = prepared.with_context(|| match &reference {
             None => format!("preprocessing {}", scan.display()),
-            Some(r) => format!("preprocessing {} on the head mask of {}", scan.display(), r.path.display()),
+            Some(r) => format!("preprocessing {} on the head mask of {}", scan.display(), r.scan.display()),
         })?;
         let start = Instant::now();
         let patch_tokens = prepared.tokens(self.model.patch())?;
@@ -232,11 +204,12 @@ impl Stager<'_> {
             ..StageSeconds::default()
         };
         Ok(Staged::Ready(Box::new(Ready {
-            scan: scan.to_path_buf(),
+            scan: scan.clone(),
             sha: target.sha256,
-            reference: reference.map(|r| ReferenceInfo { path: absolute(&r.path), sha256: r.sha256 }),
+            reference: reference.map(|r| ReferenceInfo { path: absolute(r.scan.path()), sha256: r.sha256 }),
             cache_path,
             nifti,
+            dicom: parsed.dicom,
             prepared,
             tokens: patch_tokens,
             seconds,
@@ -288,7 +261,7 @@ impl<'a> Pipeline<'a> {
     /// The cached or freshly computed embedding of one scan, preprocessed on its own or on the head
     /// mask and grid of `reference`. With `tokens`, the entry carries the patch tokens as well as
     /// the pooled embedding.
-    pub fn run(&mut self, scan: &Path, reference: Option<&Path>, tokens: bool) -> Result<ScanResult> {
+    pub fn run(&mut self, scan: &Scan, reference: Option<&Scan>, tokens: bool) -> Result<ScanResult> {
         let staged = self.stager.stage_catching(scan, reference, tokens)?;
         self.finish(staged, tokens)
     }
@@ -305,6 +278,7 @@ impl<'a> Pipeline<'a> {
             reference,
             cache_path,
             nifti,
+            dicom,
             prepared,
             tokens: patch_tokens,
             mut seconds,
@@ -329,8 +303,17 @@ impl<'a> Pipeline<'a> {
         let encoding = Encoding::new(encoder, seconds, started);
         let model = self.model();
         let reference_sha = reference.as_ref().map(|r| r.sha256.clone());
-        let mut info =
-            RunInfo::new(model, encoding, &scan, &sha, &nifti, &prepared, encoded.n_tokens, reference)?;
+        let mut info = RunInfo::new(
+            model,
+            encoding,
+            scan.path(),
+            &sha,
+            &nifti,
+            dicom.as_ref(),
+            &prepared,
+            encoded.n_tokens,
+            reference,
+        )?;
         let key = EntryKey {
             scan_sha256: &sha,
             reference_sha256: reference_sha.as_deref(),

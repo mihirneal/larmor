@@ -13,8 +13,9 @@ use crate::console::{bold, dim, green, red, secs};
 use crate::locate;
 use crate::model::Model;
 use crate::outputs::{self, ScanOutputs, check_unique_outputs};
-use crate::pipeline::{Outcome, Pipeline, ReadScan, ScanResult, panic_message};
+use crate::pipeline::{Outcome, Pipeline, ScanResult, panic_message};
 use crate::run_info::{CacheInfo, RunInfo, absolute};
+use crate::scan::Scan;
 
 /// Options of `larmor encode`.
 pub struct EncodeOptions {
@@ -32,19 +33,17 @@ pub struct EncodeOptions {
 pub fn cmd_encode(options: EncodeOptions) -> Result<()> {
     let start = Instant::now();
     let model = Model::resolve(&options.model)?;
-    let reference = options.reference.as_deref();
-    if let Some(reference) = reference {
-        check_reference(reference)?;
-    }
+    let reference = options.reference.as_deref().map(resolve_reference).transpose()?;
+    let reference = reference.as_ref();
     let found = locate::find_scans(&options.inputs, options.out.as_slice())?;
     let scans = found.scans;
     if scans.is_empty() {
-        bail!("no .nii or .nii.gz scans found");
+        bail!("no .nii, .nii.gz or DICOM scans found");
     }
     let destinations: Vec<(PathBuf, ScanOutputs)> = scans
         .iter()
         .map(|scan| {
-            let root = options.out.clone().unwrap_or_else(|| locate::default_out_dir(scan));
+            let root = options.out.clone().unwrap_or_else(|| locate::default_out_dir(scan.path()));
             let outputs = ScanOutputs::new(&root, scan, found.root.as_deref());
             (root, outputs)
         })
@@ -52,7 +51,7 @@ pub fn cmd_encode(options: EncodeOptions) -> Result<()> {
     let targets: Vec<(&Path, PathBuf)> = scans
         .iter()
         .zip(&destinations)
-        .map(|(scan, (_, o))| (scan.as_path(), o.embedding(model.id())))
+        .map(|(scan, (_, o))| (scan.path(), o.embedding(model.id())))
         .collect();
     check_unique_outputs(&targets)?;
 
@@ -141,30 +140,24 @@ pub fn cmd_encode(options: EncodeOptions) -> Result<()> {
     Ok(())
 }
 
-/// A `--reference` must be a readable NIfTI file.
-pub fn check_reference(reference: &Path) -> Result<()> {
-    if !reference.is_file() {
-        bail!("the reference scan {} does not exist", reference.display());
-    }
-    if !locate::is_nifti(reference) {
-        bail!("the reference scan {} is not a .nii or .nii.gz file", reference.display());
-    }
-    Ok(())
+/// The scan a `--reference` names: a NIfTI file or a DICOM series' folder.
+pub fn resolve_reference(reference: &Path) -> Result<Scan> {
+    Scan::resolve(reference).with_context(|| format!("the reference scan {}", reference.display()))
 }
 
 /// How [`write_outputs`] writes.
-struct WriteOptions {
-    save_preprocessed: bool,
+pub struct WriteOptions {
+    pub save_preprocessed: bool,
     /// Replace outputs that another scan wrote.
-    force: bool,
+    pub force: bool,
 }
 
 /// One scan's derivatives: the pooled embedding, run.json and, with `--save-preprocessed`, the
 /// grid image and mask.
-fn write_outputs(
+pub fn write_outputs(
     model: &Model,
-    scan: &Path,
-    reference: Option<&Path>,
+    scan: &Scan,
+    reference: Option<&Scan>,
     root: &Path,
     outputs: &ScanOutputs,
     result: &ScanResult,
@@ -173,7 +166,7 @@ fn write_outputs(
     let model_id = model.id();
     let run_json = outputs.run_json(model_id);
     if !options.force {
-        refuse_to_overwrite_another_scan(&run_json, scan, &result.entry.info.scan.sha256)?;
+        refuse_to_overwrite_another_scan(&run_json, scan.path(), &result.entry.info.scan.sha256)?;
     }
     outputs.create_dir()?;
     outputs::ensure_dataset_description(root)?;
@@ -181,7 +174,7 @@ fn write_outputs(
     outputs::write_npy_f32(&outputs.embedding(model_id), pooled, &[pooled.len()])?;
     let cache =
         CacheInfo { path: result.cache_path.display().to_string(), hit: result.outcome == Outcome::Cached };
-    outputs::write_json(&run_json, &result.entry.info.for_run(model, scan, cache))?;
+    outputs::write_json(&run_json, &result.entry.info.for_run(model, scan.path(), cache))?;
     if options.save_preprocessed {
         match &result.prepared {
             Some(prepared) => write_preprocessed(prepared, outputs, model_id)?,
@@ -210,13 +203,13 @@ fn refuse_to_overwrite_another_scan(run_json: &Path, scan: &Path, sha256: &str) 
 
 /// Reads a scan whose embedding came from the cache and runs the recipe on it again (about 0.1 s),
 /// on the head mask and grid of `reference` when one is given.
-pub fn prepare_again(model: &Model, scan: &Path, reference: Option<&Path>) -> Result<(Nifti, Prepared)> {
-    let target = ReadScan::read(scan)?;
-    let nifti = target.parse()?;
-    let reference = reference.map(ReadScan::read).transpose()?.filter(|r| r.sha256 != target.sha256);
+pub fn prepare_again(model: &Model, scan: &Scan, reference: Option<&Scan>) -> Result<(Nifti, Prepared)> {
+    let target = scan.read()?;
+    let nifti = target.parse()?.nifti;
+    let reference = reference.map(Scan::read).transpose()?.filter(|r| r.sha256 != target.sha256);
     let prepared = match reference {
         None => model.recipe.run(&nifti),
-        Some(reference) => model.recipe.run_with_reference(&nifti, &reference.parse()?),
+        Some(reference) => model.recipe.run_with_reference(&nifti, &reference.parse()?.nifti),
     };
     let prepared = prepared.with_context(|| format!("preprocessing {}", scan.display()))?;
     Ok((nifti, prepared))
