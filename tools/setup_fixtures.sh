@@ -38,6 +38,8 @@ step "python env (uv sync in tools/)"
 command -v uv >/dev/null || { echo "uv is required: https://docs.astral.sh/uv/" >&2; exit 1; }
 (cd "$TOOLS" && uv sync --frozen --inexact --quiet)
 "$PY" -c "import torch, nibabel, scipy; print('ok: torch', torch.__version__)"
+# dcm2niix --version exits with status 3
+echo "ok: dcm2niix $("$TOOLS/.venv/bin/dcm2niix" --version 2>&1 | tail -1 || true)"
 
 step "reference models"
 models_present=1
@@ -52,7 +54,7 @@ else
   (cd "$TOOLS" && "$PY" make_models.py reference)
 fi
 
-step "fixture scans and manifest"
+step "fixture scans, DICOM series (dcm2niix's NIfTI of each) and manifest"
 (cd "$TOOLS" && "$PY" fetch_fixtures.py)
 
 step "PyTorch references (prep for every scan, patch-8 encode for every scan, patch-4 for a few)"

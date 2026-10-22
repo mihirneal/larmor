@@ -1,5 +1,7 @@
 # Reference tools: PyTorch/nibabel/scipy outputs that Larmor is checked against.
-# Versions match nanobrain's uv.lock so the reference behaves like the cluster.
+# Versions match nanobrain's uv.lock so the reference behaves like the cluster. dcm2niix (not in
+# nanobrain's lock) is the DICOM converter Larmor's DICOM reader is checked against; its wheels
+# bundle the JPEG 2000 and JPEG-LS decoders Homebrew's build lacks.
 [project]
 name = "larmor-tools"
 version = "0.1.0"
@@ -19,6 +21,7 @@ dependencies = [
     "fsspec==2026.6.0",
     "zstandard==0.25.0",
     "pandas==3.0.5",
+    "dcm2niix==1.0.20260724",
     "pytest",
 ]
 
