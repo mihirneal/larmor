@@ -10,21 +10,24 @@ implementation contract: formats, layouts and gates that the crates and tools ag
 ## Pipeline
 
 ```
-scan.nii.gz ─▶ head mask ─▶ conform ─▶ quantize ─▶ normalize ─▶ tokens ─▶ encoder ─▶ cache ─▶ probes
-              (native)     (192×240×192, 1 mm)                 (in-mask 8³ patches)   (tokens + pooled)
+scan.nii.gz ─────────────────┐
+DICOM series ─▶ dcm2niix's ──┴▶ head mask ─▶ conform ─▶ quantize ─▶ normalize ─▶ tokens ─▶ encoder ─▶ cache ─▶ probes
+                NIfTI image     (native)     (192×240×192, 1 mm)                 (in-mask 8³ patches)   (tokens + pooled)
 ```
 
 A new probe never re-runs the encoder: it trains on the cache. Only new scans are preprocessed and encoded.
+`larmor watch` runs the same pipeline on scans as they arrive in watched folders.
 
 ## Workspace
 
 | Crate | What it is | Mirrors |
 |---|---|---|
 | `larmor-volume` | NIfTI I/O, affines, orientation, resampling, Gaussian filter, morphology, quantiles | nibabel, scipy.ndimage, numpy |
+| `larmor-dicom` | DICOM series (via dicom-rs) to the NIfTI image dcm2niix writes for them | dcm2niix v1.0.20260724 |
 | `larmor-prep` | Preprocessing recipes built from those ops; patchify and tokens | `nanobrain.eval.preprocessing`, `eval/prepare.py::prepare_images`, `ViTMAE3D.dense_embed` |
 | `larmor-model` | `model.toml` manifests, safetensors weights, the 3D ViT encoder on Candle | `nanobrain.model.ViTMAE3D`, `nanobrain.modules` |
 | `larmor-probe` | Whole-scan and dense linear probes, CV folds, metrics, probe files | `nanobrain.eval.probe`, sklearn |
-| `larmor` | The CLI: encode, cache, outputs, probe fit/apply, check-parity, bench, models ([CLI.md](CLI.md)) | |
+| `larmor` | The CLI: encode, cache, outputs, probe fit/apply, watch, check-parity, bench, models ([CLI.md](CLI.md)) | |
 
 The core crates build on macOS (Metal) and Linux (CUDA, the `cuda` feature; not yet built or tested, since
 it needs the CUDA toolkit). Only the future viewer is macOS-only.
@@ -82,6 +85,61 @@ Analyze headers and complex or RGB data are refused (convert them; for complex d
 image). A file is read header first, and only the voxel bytes the header describes are decompressed. A
 header whose sizes overflow, or geometry so corrupt that a smoothing kernel or the 2 mm mask grid would be
 absurd (voxel sizes like 1e-30 or 1e30 mm), is an error for that scan (where nibabel and scipy fail too).
+
+### DICOM input: dcm2niix's NIfTI
+
+A DICOM series goes through the recipe as the NIfTI file dcm2niix v1.0.20260724 (default options) writes for
+it, loaded by nibabel: `larmor-dicom` builds that image in memory, with the same voxel array and dtype, sform
+(`img.affine`), `pixdim` (`get_zooms()`) and `scl_slope`/`scl_inter`, so the rest of the pipeline cannot
+tell the two apart (`check-parity` gates both). It mirrors `saveDcm2NiiCore` for one 3-D volume of classic
+DICOM, read with dicom-rs:
+
+1. **Series**: files grouped by SeriesInstanceUID; copies (same SOPInstanceUID) count once. Every slice must
+   have one frame of grey levels, ImagePositionPatient, ImageOrientationPatient and PixelSpacing, and the
+   same size, sample format, PixelSpacing, orientation (within 1e-4, as dcm2niix's localizer test), echo and
+   MRAcquisitionType; no gantry tilt.
+2. **Order**: by `(SeriesNumber << 32) + InstanceNumber`, then AcquisitionTime in ms (`fillTDCMsort`).
+   If the signed steps along the slice normal (`cross(row, column)`) between consecutive slices are not all
+   the first step within 0.2 mm, re-sorted by signed distance from the first slice
+   (`ensureSequentialSlicePositions`).
+3. **Spacing**: `dx` = the distance between the first two positions (float32, `intersliceDistance`). Any
+   step differing from `dx` by more than 0.2 mm (missing slices), or a repeated position (4-D), is refused:
+   NIfTI cannot hold either, and dcm2niix writes them with a wrong geometry or as 4-D.
+4. **Header zooms**: `pixdim` = (column spacing, row spacing, SpacingBetweenSlices, else SliceThickness,
+   else 1), the third replaced by `dx` when they differ by more than 0.0001 mm. The sform always uses `dx`
+   (so a 2-D series can carry 4.799995 in the affine and 4.8 in `pixdim`, as dcm2niix's file does).
+5. **sform** (`nifti_dicom2mat`, `verify_slice_dir`): rows of the orientation normalised, their cross
+   product, times the voxel sizes, the first slice's position as the origin; the slice column negated when
+   the second slice lies against it; x and y negated (LPS to RAS). If the column was negated, the stack is
+   reversed and the last slice becomes the origin (`nii_flipZ`).
+6. **Reorientation**: a 3-D acquisition (MRAcquisitionType `3D`, or Philips' private copy) that is not
+   echo-planar is permuted and flipped to its nearest orthogonal orientation with the most left, posterior,
+   inferior corner as voxel 0 (`nii_setOrtho`); anything else has its rows reversed (`nii_flipY`).
+7. **Samples and scaling**: int16 for signed or fewer-than-16-bit samples (12-bit ones masked as
+   `nii_mask12bit`), uint16, uint8 or int32 as dcm2niix stores them; RescaleSlope and RescaleIntercept as
+   the header's scale factors, replaced for Philips by the precise values `(R·RS + RI) / (RS·SS)` when
+   (2005,100E) ScaleSlope is present (`PhilipsPrecise`, dcm2niix's default `-p y`). When slope or intercept
+   differ between slices, every slice is scaled into float32 voxels (`nii_iVaries`; refused for Philips,
+   whose precise-value rescaling of such series Larmor does not reproduce).
+
+**Bit-exact in float32.** dcm2niix keeps its matrices in `float` and the macOS and PyPI builds are compiled
+by clang, which fuses a multiply and an add written in one C expression into one fused multiply-add
+(`-ffp-contract=on`): `a*b + c*d` becomes `fma(a, b, c*d)`, a `+=` of a product fuses into the sum. Larmor
+ports each of those expressions with `mul_add` in exactly those places (`larmor-dicom/src/geometry.rs`),
+and parses decimal strings as dcm2niix does (`atof` to double, then float), so the sforms are bit-identical
+on every gated series. A dcm2niix built by another compiler (GCC on x86-64 does not fuse) can differ from
+it, and so from Larmor, in the last bit of an oblique affine.
+
+**Identity.** A series' SHA-256, which stands in for a file's in `run.json` and the cache key, is the
+SHA-256 of `larmor-dicom series v<IMPL_VERSION>` and its files' SHA-256s, sorted: renaming or moving the
+files keeps the cached embedding, and bumping `larmor_dicom::IMPL_VERSION` (any change that could move a
+converted image) gives every DICOM series new cache entries.
+
+**Refused**, with the reason: enhanced multi-frame files (not read yet), Siemens mosaics, colour images,
+JPEG-LS (no pure-Rust decoder; dcm2niix needs CharLS), localizers and other series with mixed
+orientations or sizes, 4-D series, several echoes in one series (dcm2niix writes `_e1`, `_e2`...), varying
+slice spacing, gantry tilt, single slices. A folder search skips such series with a note; inside a BIDS
+dataset it skips `sourcedata/`, where a dataset's DICOM usually lives next to its converted NIfTI.
 
 ### Multi-modal: a reference scan's head mask
 
@@ -195,10 +253,12 @@ Produced by `tools/` with the PyTorch/nibabel/scipy stack pinned to nanobrain's 
 ```
 fixtures/
 ├── nanobrain/                          pinned checkout of MedARC-AI/nanobrain @ a1bfdd1
-├── manifest.toml                       [[scan]] name, file, source, sha256, notes
-├── scans/<scan>.nii.gz                 inputs (public data and synthetic variants)
+├── manifest.toml                       [[scan]] name, file, source, sha256, notes; [[pair]]; [[dicom]]
+├── scans/<scan>.nii.gz                 inputs (public data, synthetic variants, dcm2niix's NIfTI of DICOM series)
+├── dicom/<name>/                       DICOM series (dcm2niix's validation sets, pinned by commit)
 ├── models/<model_id>.toml + .safetensors
 └── reference/
+    ├── dicom/<name>/dcm2niix.json      dcm2niix's BIDS sidecar of each converted series
     ├── prep/<scan>/
     │   ├── head_mask.nii.gz            uint8, native space (threshold_mask)
     │   ├── conform.nii.gz              float32, 192×240×192 (conform_image, before quantize)
@@ -221,14 +281,21 @@ Encode reference tensors (`__metadata__` holds model_id, model_sha256, scan, tor
 | `pooled` | f32 `[D]` | mean of `tokens` |
 | `tokens_bf16`, `pooled_bf16` | f32 | the same under bf16 autocast (the eval framework's default) |
 
+A `[[dicom]]` entry is a DICOM set: `kind = "series"` must convert bit for bit to the `[[scan]]` named
+`scan` (made by the pinned dcm2niix, `dcm2niix==1.0.20260724` in `tools/`) and then pass that scan's prep
+and encode references from the DICOM files; `"refuse"` must be refused with a message containing `refuse`;
+`"pixels"` must decode to the same samples in every transfer syntax except those in `unsupported`. The sets
+come from dcm2niix's own validation repositories (`neurolabusc/dcm_qa_*`, BSD-2-Clause), since CC0 DICOM
+of MR heads is scarce (OpenNeuro keeps converted NIfTI, not DICOM).
+
 Reference models `nanobrain-vits-p8-ref` / `nanobrain-vits-p4-ref` are nanobrain's ViT-S config with
 `torch.manual_seed(0)` init, then every parameter perturbed so biases and norms are non-trivial. Real
 checkpoints export with `tools/export_checkpoint.py` where they live (the cluster).
 
 ## Embedding cache
 
-Key = `sha256(scan file bytes)` + the reference scan's sha256 (multi-modal) + preprocessing version + encoder
-key + precision (`f32`, `f16`, `bf16`). Location `$LARMOR_CACHE` or `~/Library/Caches/larmor`
+Key = `sha256(scan file bytes)` (for a DICOM series, its series SHA-256 above) + the reference scan's sha256
+(multi-modal) + preprocessing version + encoder key + precision (`f32`, `f16`, `bf16`). Location `$LARMOR_CACHE` or `~/Library/Caches/larmor`
 (`$XDG_CACHE_HOME/larmor` on Linux):
 
 ```
@@ -244,11 +311,12 @@ depend on whether a scan was cached.
 
 | Command | What it does |
 |---|---|
-| `larmor encode <scan or folder> --model <id>` | Preprocess, encode, cache tokens and the pooled embedding, write `run.json` |
+| `larmor encode <scan or folder> --model <id>` | Preprocess, encode, cache tokens and the pooled embedding, write `run.json`; scans are NIfTI files or DICOM series |
 | `larmor probe fit <labels.tsv> --model <id> --kind <kind>` | Train a regression, classification or segmentation probe from cached embeddings with CV; write `probe.toml` and weights |
 | `larmor probe apply <probe.toml> <scan or folder>` | Predict with a saved probe; segmentation writes a NIfTI mask |
 | `larmor models` | List, download and verify model weights |
-| `larmor check-parity <fixtures>` | Compare preprocessing stages and embeddings with the PyTorch references |
+| `larmor watch --site site.toml` | Encode scans as they arrive in watched folders (Box Drive, network shares), logging every action |
+| `larmor check-parity <fixtures>` | Compare DICOM conversions with dcm2niix and preprocessing stages and embeddings with the PyTorch references |
 | `larmor bench` | Per-scan timing on this machine, like `onset timing-test` |
 
 Outputs go to a BIDS-derivatives folder (`derivatives/larmor/sub-XX/[ses-YY/]anat/…`), with a `run.json`
@@ -257,6 +325,19 @@ per encode: model id and sha256, preprocessing version, larmor version, mask vol
 `labels.tsv`: one row per scan, like BIDS `participants.tsv`. Column `scan` (path, relative to the TSV),
 label columns, optional `fold` (0-based) to force CV folds. Segmentation labels are a column of NIfTI paths
 in the scan's native space.
+
+## Watching folders (`site.toml`)
+
+`larmor watch` is the scanner-side service: a site file (like Onset's rig files; `examples/site.toml`)
+lists source folders, an output folder, the models and two timings, and the watcher polls the sources,
+waits until a scan's files stop changing (`settle_seconds`; a DICOM series' whole folder must be quiet,
+since cloud folders sync a series a file at a time), encodes it through the cache with every model and
+appends every action to a log. Polling, not file events: Box Drive (a macOS File Provider under
+`~/Library/CloudStorage/`) and network shares do not deliver events reliably, listing does not download
+files, and settling is timed by the watcher's own observation because synced files keep their original
+modification times. Headers are read once per settled file. A ledger next to the log keys each scan by
+its files' paths, sizes and times and the models' encoder keys, so restarts skip finished scans and a scan
+whose files change (late slices) is encoded again. No lab paths are built in.
 
 ## Probes (must equal the eval framework's numbers)
 
@@ -288,3 +369,8 @@ folds leak between training and test.
   also compared on its own (mask agreement, conform/quantize max error) so a mismatch points to its step.
 - **Phase 2, probes:** reproduce the eval framework on one scan-level and one segmentation task. Here that
   is checked by running nanobrain's own probe functions on shared features and comparing every output.
+- **Phase 3, ingest:** DICOM series convert bit for bit to dcm2niix's NIfTI (voxels, dtype, affine, zooms,
+  scaling) on Siemens (VE11, XA30), GE, Philips and UIH series, 2-D and 3-D, four patient positions,
+  uncompressed, fragmented JPEG lossless and JPEG 2000, and the whole recipe and encode then match
+  nanobrain's prepare on dcm2niix's NIfTI; series dcm2niix makes something other than one volume of are
+  refused with the reason; `watch` encodes a local folder end to end (CLI tests).
