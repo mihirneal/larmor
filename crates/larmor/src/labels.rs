@@ -8,8 +8,10 @@
 //!
 //! `scan` is a path relative to the TSV (absolute paths work too). Every other column is a label;
 //! `fold` (0-based) optionally fixes the outer cross-validation folds. Empty cells and `n/a` are
-//! missing values: rows missing the label being fitted are left out.
+//! missing values: rows missing the label being fitted are left out. A UTF-8 byte order mark
+//! (Excel's "UTF-8" export) is ignored.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -58,6 +60,8 @@ impl LabelTable {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let text =
             String::from_utf8(bytes.clone()).with_context(|| format!("{} is not UTF-8", path.display()))?;
+        // spreadsheets' "UTF-8" exports start with a byte order mark, which is not whitespace
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         let base = path.parent().unwrap_or(Path::new("."));
         let mut lines = text
             .lines()
@@ -161,22 +165,26 @@ impl LabelColumn<'_> {
     }
 
     /// The two classes for classification, `[negative, positive]`: sorted numerically when every
-    /// value is a number, else alphabetically, so `0`/`1` and `false`/`true` give positive = the
-    /// second, as sklearn's `classes_[1]`.
+    /// value is a number, else alphabetically (one decision for the whole column), so `0`/`1` and
+    /// `false`/`true` give positive = the second, as sklearn's `classes_[1]`.
     pub fn classes(&self) -> Result<[String; 2]> {
-        let mut classes: Vec<&String> = self.values.iter().collect();
-        classes.sort_by(|a, b| match (a.parse::<f64>(), b.parse::<f64>()) {
-            (Ok(x), Ok(y)) => x.total_cmp(&y),
-            _ => a.cmp(b),
-        });
-        classes.dedup();
+        let distinct: BTreeSet<&str> = self.values.iter().map(String::as_str).collect();
+        let numbers: Option<Vec<(f64, &str)>> =
+            distinct.iter().map(|&v| v.parse::<f64>().ok().map(|x| (x, v))).collect();
+        let classes: Vec<&str> = match numbers {
+            Some(mut numbers) => {
+                numbers.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+                numbers.into_iter().map(|(_, v)| v).collect()
+            }
+            None => distinct.into_iter().collect(),
+        };
         match classes.as_slice() {
-            [negative, positive] => Ok([(*negative).clone(), (*positive).clone()]),
+            [negative, positive] => Ok([negative.to_string(), positive.to_string()]),
             _ => bail!(
                 "classification needs exactly two classes in column {}; found {}: {}",
                 self.name,
                 classes.len(),
-                classes.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
+                classes.join(", ")
             ),
         }
     }
@@ -237,6 +245,31 @@ mod tests {
     fn numeric_classes_sort_numerically() {
         let (_dir, t) = table("scan\tlabel\na\t10\nb\t9\nc\t10\n");
         assert_eq!(t.column("label").unwrap().classes().unwrap(), ["9".to_string(), "10".to_string()]);
+    }
+
+    #[test]
+    fn classes_of_mixed_columns_are_counted_without_panicking() {
+        // numbers and text: the old comparator was not a total order and sort_by panicked
+        let values = ["10", "9", "5a", "2", "1b", "100", "x", "0"];
+        let rows: String = (0..30).map(|i| format!("s{i}\t{}\n", values[i * 7 % values.len()])).collect();
+        let (_dir, t) = table(&format!("scan\tgroup\n{rows}"));
+        let err = t.column("group").unwrap().classes().unwrap_err().to_string();
+        assert!(err.contains("found 8:"), "{err}");
+        let (_dir, t) = table("scan\tgroup\na\t2\nb\t10\nc\t1b\nd\t2\ne\t10\n");
+        let err = t.column("group").unwrap().classes().unwrap_err().to_string();
+        assert!(err.ends_with("found 3: 10, 1b, 2"), "{err}");
+        // text sorts as text, also when some values look like numbers
+        let (_dir, t) = table("scan\tgroup\na\t2b\nb\t10\nc\t2b\n");
+        assert_eq!(t.column("group").unwrap().classes().unwrap(), ["10".to_string(), "2b".to_string()]);
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_ignored() {
+        let (_dir, t) = table("\u{feff}scan\tage\na.nii.gz\t30\n");
+        assert_eq!(t.columns[0], "scan");
+        assert_eq!(t.column("age").unwrap().numbers(&t.path).unwrap(), vec![30.0]);
+        let (_dir, t) = table("\u{feff}# exported from Excel\nscan\tage\na.nii.gz\t30\n");
+        assert_eq!(t.rows.len(), 1);
     }
 
     #[test]
