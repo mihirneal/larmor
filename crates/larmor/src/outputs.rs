@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::locate;
+use crate::scan::Scan;
 
 /// The output files of one scan: `<out>/<sub-XX/[ses-YY/]datatype, folders below the inputs, or
 /// stem>/<stem>_...` (see [`locate::output_subdir`]).
@@ -19,11 +20,8 @@ pub struct ScanOutputs {
 
 impl ScanOutputs {
     /// `input_root` is the inputs' common folder ([`locate::FoundScans::root`]).
-    pub fn new(out_root: &Path, scan: &Path, input_root: Option<&Path>) -> ScanOutputs {
-        ScanOutputs {
-            dir: out_root.join(locate::output_subdir(scan, input_root)),
-            stem: locate::scan_stem(scan),
-        }
+    pub fn new(out_root: &Path, scan: &Scan, input_root: Option<&Path>) -> ScanOutputs {
+        ScanOutputs { dir: out_root.join(locate::output_subdir(scan, input_root)), stem: scan.stem() }
     }
 
     fn file(&self, suffix: &str) -> PathBuf {

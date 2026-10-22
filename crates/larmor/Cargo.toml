@@ -26,6 +26,12 @@ ureq = "3.5.0"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 larmor-volume = { path = "../larmor-volume" }
+larmor-dicom = { path = "../larmor-dicom" }
 larmor-prep = { path = "../larmor-prep" }
 larmor-model = { path = "../larmor-model" }
 larmor-probe = { path = "../larmor-probe" }
+
+[dev-dependencies]
+dicom-core = "0.10.0"
+dicom-dictionary-std = "0.10.0"
+dicom-object = "0.10.0"

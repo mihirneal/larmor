@@ -65,8 +65,8 @@ fn encode_and_probes_on_fixture_scans() {
     assert!(out.contains(&format!("0 encoded, {} cached, 0 failed", scans.len())), "{out}");
 
     // scan-level labels for every scan: head volume (regression) and MNI template or OpenNeuro scan
-    // (classification: 15 vs 10, so every outer training fold keeps at least 5 of each class, which
-    // LogisticRegressionCV's inner StratifiedKFold(5) needs; T1w or not, 19 vs 6, does not);
+    // (classification: 15 vs 21, so every outer training fold keeps at least 5 of each class, which
+    // LogisticRegressionCV's inner StratifiedKFold(5) needs);
     // for ten scans a 25 mm sphere above the grid centre drawn in each scan's own voxels
     // (segmentation, two folds fixed by the fold column)
     let mut scan_tsv = String::from("scan\thead_ml\ttemplate\n");

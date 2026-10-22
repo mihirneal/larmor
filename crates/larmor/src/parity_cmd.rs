@@ -47,6 +47,30 @@ struct FixtureManifest {
     /// Target scans prepared on a reference scan's head mask and grid.
     #[serde(default)]
     pair: Vec<FixturePair>,
+    /// DICOM series and what Larmor must make of them.
+    #[serde(default)]
+    dicom: Vec<FixtureDicom>,
+}
+
+/// A `[[dicom]]`: the DICOM files under `folder`.
+#[derive(Deserialize)]
+struct FixtureDicom {
+    name: String,
+    /// Relative to the fixtures folder.
+    folder: String,
+    /// `series`: converts bit-exact to the `[[scan]]` named `scan` (dcm2niix's NIfTI of it) and passes
+    /// that scan's recipe and encode references; `refuse`: refused with a message containing
+    /// `refuse`; `pixels`: every file decodes to the same samples, except the transfer syntaxes in
+    /// `unsupported`, which are refused.
+    kind: String,
+    /// SHA-256 of the files' SHA-256s, sorted (as `tools/fetch_fixtures.py` pins them).
+    files_sha256: String,
+    #[serde(default)]
+    scan: Option<String>,
+    #[serde(default)]
+    refuse: Option<String>,
+    #[serde(default)]
+    unsupported: Vec<String>,
 }
 
 /// A `[[pair]]`: `target` prepared on `reference`'s head mask and grid, as `prepare_images` does
@@ -99,13 +123,37 @@ struct EncodeReport {
     seconds: f64,
 }
 
+/// What a report row checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Checked {
+    /// A NIfTI scan through the recipe and the encoders.
+    #[default]
+    Scan,
+    /// A target on a reference scan's mask, gated bit-exact.
+    Pair,
+    /// A DICOM series converted, then through the recipe and the encoders.
+    Dicom,
+    /// A DICOM series that must be refused.
+    DicomRefusal,
+    /// DICOM files in several transfer syntaxes that must decode alike.
+    DicomPixels,
+}
+
+impl Checked {
+    /// Rows that run the recipe and so count in the preprocessing gates.
+    fn has_prep(self) -> bool {
+        matches!(self, Checked::Scan | Checked::Pair | Checked::Dicom)
+    }
+}
+
 #[derive(Default)]
 struct ScanReport {
     name: String,
-    /// A pair: a target on a reference scan's mask, gated bit-exact.
-    pair: bool,
+    checked: Checked,
     prep: Option<PrepReport>,
     encodes: Vec<EncodeReport>,
+    /// A DICOM series: converted voxels, dtype, affine, zooms and scaling equal dcm2niix's.
+    conversion_exact: Option<bool>,
     failures: Vec<String>,
     seconds: f64,
 }
@@ -163,12 +211,175 @@ pub fn cmd_check_parity(options: ParityOptions) -> Result<()> {
         print_rows(&report);
         reports.push(report);
     }
+    for dicom in &manifest.dicom {
+        let report = check_dicom(root, dicom, &manifest.scan, &prep_recipe, &models);
+        print_rows(&report);
+        reports.push(report);
+    }
     let failed = print_summary(&reports, &models, start.elapsed().as_secs_f64());
     if failed > 0 {
-        let what = if manifest.pair.is_empty() { "scans" } else { "scans and pairs" };
-        bail!("{failed} of {} {what} failed a parity gate", reports.len());
+        bail!("{failed} of {} {} failed a parity gate", reports.len(), what_was_checked(&reports));
     }
     Ok(())
+}
+
+/// `scans`, `scans and pairs`, or `fixtures` when DICOM sets were checked too.
+fn what_was_checked(reports: &[ScanReport]) -> &'static str {
+    let has = |checked: Checked| reports.iter().any(|r| r.checked == checked);
+    if has(Checked::Dicom) || has(Checked::DicomRefusal) || has(Checked::DicomPixels) {
+        "fixtures"
+    } else if has(Checked::Pair) {
+        "scans and pairs"
+    } else {
+        "scans"
+    }
+}
+
+fn check_dicom(
+    root: &Path,
+    dicom: &FixtureDicom,
+    scans: &[FixtureScan],
+    prep_recipe: &Recipe,
+    models: &BTreeMap<String, ReferenceModel>,
+) -> ScanReport {
+    let start = Instant::now();
+    let checked = match dicom.kind.as_str() {
+        "refuse" => Checked::DicomRefusal,
+        "pixels" => Checked::DicomPixels,
+        _ => Checked::Dicom,
+    };
+    let mut report = ScanReport { name: dicom.name.clone(), checked, ..ScanReport::default() };
+    if let Err(err) = check_dicom_inner(root, dicom, scans, prep_recipe, models, &mut report) {
+        report.failures.push(format!("{err:#}"));
+    }
+    report.seconds = start.elapsed().as_secs_f64();
+    report
+}
+
+/// Every file below `dir`, sorted, with its bytes.
+fn read_tree(dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut paths = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(folder) = stack.pop() {
+        for entry in std::fs::read_dir(&folder).with_context(|| format!("reading {}", folder.display()))? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            Ok((path, bytes))
+        })
+        .collect()
+}
+
+/// `tools/fetch_fixtures.py::files_sha256`: the SHA-256 of the files' SHA-256s, sorted.
+fn files_sha256(files: &[(PathBuf, Vec<u8>)]) -> String {
+    let mut digests: Vec<String> = files.iter().map(|(_, bytes)| sha256_hex(bytes)).collect();
+    digests.sort();
+    sha256_hex(digests.iter().map(|d| format!("{d}\n")).collect::<String>().as_bytes())
+}
+
+fn check_dicom_inner(
+    root: &Path,
+    dicom: &FixtureDicom,
+    scans: &[FixtureScan],
+    prep_recipe: &Recipe,
+    models: &BTreeMap<String, ReferenceModel>,
+    report: &mut ScanReport,
+) -> Result<()> {
+    let files = read_tree(&root.join(&dicom.folder))?;
+    let sha = files_sha256(&files);
+    report
+        .gate(sha == dicom.files_sha256, || format!("files_sha256 {sha} vs manifest {}", dicom.files_sha256));
+    match report.checked {
+        Checked::DicomRefusal => {
+            let expected = dicom.refuse.as_deref().unwrap_or_default();
+            match larmor_dicom::convert_files(&files) {
+                Ok(_) => report.failures.push(format!("converted, but should be refused ({expected})")),
+                Err(err) => report.gate(err.to_string().contains(expected), || {
+                    format!("refused with \"{err}\", not a message containing \"{expected}\"")
+                }),
+            }
+            Ok(())
+        }
+        Checked::DicomPixels => {
+            let mut first: Option<(&Path, Vec<u8>)> = None;
+            for (path, bytes) in &files {
+                let header = larmor_dicom::SliceHeader::from_bytes(path, bytes)?;
+                let decoded = larmor_dicom::decode_pixels(path, bytes);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if dicom.unsupported.contains(&header.transfer_syntax) {
+                    report.gate(decoded.is_err(), || {
+                        format!("{name}: {} decoded but should be refused", header.transfer_syntax)
+                    });
+                    continue;
+                }
+                match (decoded, &first) {
+                    (Err(err), _) => report.failures.push(format!("{name}: {err}")),
+                    (Ok(samples), None) => first = Some((path, samples)),
+                    (Ok(samples), Some((first_path, expected))) => report.gate(samples == *expected, || {
+                        format!(
+                            "{name} ({}) decodes to other samples than {}",
+                            header.transfer_syntax,
+                            first_path.display()
+                        )
+                    }),
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            let scan_name = dicom.scan.as_deref().context("a [[dicom]] series needs `scan`")?;
+            let scan = scans
+                .iter()
+                .find(|s| s.name == scan_name)
+                .with_context(|| format!("no [[scan]] named {scan_name}"))?;
+            let converted = larmor_dicom::convert_files(&files)?;
+            let reference_path = root.join(&scan.file);
+            let reference = read_nifti(&reference_path)?;
+            let exact = compare_conversion(&converted.nifti, &reference, report)?;
+            report.conversion_exact = Some(exact);
+            check_prepared(root, scan_name, &converted.nifti, None, prep_recipe, models, report)
+        }
+    }
+}
+
+/// The converted image against dcm2niix's NIfTI as nibabel loads it: shape, dtype, voxels, affine,
+/// zooms and scale factors all equal.
+fn compare_conversion(ours: &Nifti, dcm2niix: &Nifti, report: &mut ScanReport) -> Result<bool> {
+    let before = report.failures.len();
+    report.gate(ours.shape() == dcm2niix.shape(), || {
+        format!("shape {:?} vs dcm2niix {:?}", ours.shape(), dcm2niix.shape())
+    });
+    report.gate(ours.data.dtype() == dcm2niix.data.dtype(), || {
+        format!("dtype {} vs dcm2niix {}", ours.data.dtype().name(), dcm2niix.data.dtype().name())
+    });
+    let (a, b) = (ours.affine()?, dcm2niix.affine()?);
+    report.gate(a == b, || format!("affine {:?} vs dcm2niix {:?}", a.0, b.0));
+    report.gate(ours.zooms() == dcm2niix.zooms(), || {
+        format!("zooms {:?} vs dcm2niix {:?}", ours.zooms(), dcm2niix.zooms())
+    });
+    let scaling = |n: &Nifti| n.header.scaling();
+    report.gate(scaling(ours) == scaling(dcm2niix), || {
+        format!("scaling {:?} vs dcm2niix {:?}", scaling(ours), scaling(dcm2niix))
+    });
+    if ours.shape() == dcm2niix.shape()
+        && ours.data.dtype() == dcm2niix.data.dtype()
+        && ours.data != dcm2niix.data
+    {
+        let (x, y) = (ours.data.to_f64(), dcm2niix.data.to_f64());
+        let differ = x.iter().zip(y.iter()).filter(|(p, q)| p != q).count();
+        report.failures.push(format!("{differ} voxels differ from dcm2niix's"));
+    }
+    Ok(report.failures.len() == before)
 }
 
 fn check_pair(
@@ -179,7 +390,7 @@ fn check_pair(
     models: &BTreeMap<String, ReferenceModel>,
 ) -> ScanReport {
     let start = Instant::now();
-    let mut report = ScanReport { name: pair.name.clone(), pair: true, ..ScanReport::default() };
+    let mut report = ScanReport { name: pair.name.clone(), checked: Checked::Pair, ..ScanReport::default() };
     if let Err(err) = check_pair_inner(root, pair, scans, prep_recipe, models, &mut report) {
         report.failures.push(format!("{err:#}"));
     }
@@ -329,23 +540,37 @@ fn check_scan_inner(
     let sha = sha256_hex(&bytes);
     report.gate(sha == scan.sha256, || format!("scan sha256 {sha} vs manifest {}", scan.sha256));
     let nifti = Nifti::from_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    check_prepared(root, &scan.name, &nifti, Some(&sha), prep_recipe, models, report)
+}
 
-    let dir = root.join("reference/prep").join(&scan.name);
-    let (prepared, references) = rayon::join(|| prep_recipe.run(&nifti), || PrepReferences::read(&dir));
+/// The recipe on `nifti` against `reference/prep/<name>/` (made from the file with SHA-256 `sha`,
+/// when given), then each model's encode against `reference/encode/<model>/<name>.safetensors`.
+fn check_prepared(
+    root: &Path,
+    name: &str,
+    nifti: &Nifti,
+    sha: Option<&str>,
+    prep_recipe: &Recipe,
+    models: &BTreeMap<String, ReferenceModel>,
+    report: &mut ScanReport,
+) -> Result<()> {
+    let dir = root.join("reference/prep").join(name);
+    let (prepared, references) = rayon::join(|| prep_recipe.run(nifti), || PrepReferences::read(&dir));
     let prepared = prepared.context("preprocessing")?;
     let references = references?;
-    report.gate(references.info["scan_sha256"].as_str() == Some(sha.as_str()), || {
-        "prep reference was made from another file".into()
-    });
+    if let Some(sha) = sha {
+        report.gate(references.info["scan_sha256"].as_str() == Some(sha), || {
+            "prep reference was made from another file".into()
+        });
+    }
     report.prep = Some(compare_prep(&references, &prepared, report));
 
     for (id, reference_model) in models {
-        let reference_path =
-            root.join("reference/encode").join(id).join(format!("{}.safetensors", scan.name));
+        let reference_path = root.join("reference/encode").join(id).join(format!("{name}.safetensors"));
         if !reference_path.is_file() {
             continue;
         }
-        let encode = compare_encode(reference_model, &reference_path, &nifti, None, &prepared, prep_recipe)
+        let encode = compare_encode(reference_model, &reference_path, nifti, None, &prepared, prep_recipe)
             .with_context(|| id.clone())?;
         gate_encode(report, id, &encode);
         report.encodes.push(encode);
@@ -655,7 +880,8 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
     let conform_exact = prep_worst(|p| p.conform_exact, Worse::Smaller);
     let quant = prep_worst(|p| p.quant_exact, Worse::Smaller);
     let quant_diff = preps.iter().map(|(_, p)| p.quant_max_diff).max().unwrap_or(0);
-    let not_exact: Vec<&str> = reports
+    let with_prep: Vec<&ScanReport> = reports.iter().filter(|r| r.checked.has_prep()).collect();
+    let not_exact: Vec<&str> = with_prep
         .iter()
         .filter(|r| !r.prep.as_ref().is_some_and(|p| p.scalars_exact))
         .map(|r| r.name.as_str())
@@ -670,7 +896,7 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
         let status = if ok { green("pass") } else { red("FAIL") };
         println!("  {name:<44} {value:>28}  {scan:<26} {limit:<10} {status}");
     };
-    let have_prep = preps.len() == reports.len() && !preps.is_empty();
+    let have_prep = preps.len() == with_prep.len() && !preps.is_empty();
     row(
         "head mask disagreement",
         format!("{:.4}%", 100.0 * head.value),
@@ -701,12 +927,12 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
     );
     row(
         "vmin, vmax, centroid, fit affine, fwhm exact",
-        format!("{}/{} scans", reports.len() - not_exact.len(), reports.len()),
+        format!("{}/{} scans", with_prep.len() - not_exact.len(), with_prep.len()),
         not_exact.first().copied().unwrap_or("-"),
         "all",
         not_exact.is_empty(),
     );
-    let pairs: Vec<&ScanReport> = reports.iter().filter(|r| r.pair).collect();
+    let pairs: Vec<&ScanReport> = reports.iter().filter(|r| r.checked == Checked::Pair).collect();
     if !pairs.is_empty() {
         let inexact: Vec<&str> =
             pairs.iter().filter(|r| !r.failures.is_empty()).map(|r| r.name.as_str()).collect();
@@ -718,6 +944,27 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
             inexact.is_empty(),
         );
     }
+    let kind_row = |checked: Checked, gate: &str, unit: &str| {
+        let rows: Vec<&ScanReport> = reports.iter().filter(|r| r.checked == checked).collect();
+        if rows.is_empty() {
+            return;
+        }
+        let ok = |r: &ScanReport| match checked {
+            Checked::Dicom => r.conversion_exact == Some(true),
+            _ => r.failures.is_empty(),
+        };
+        let bad: Vec<&str> = rows.iter().filter(|r| !ok(r)).map(|r| r.name.as_str()).collect();
+        row(
+            gate,
+            format!("{}/{} {unit}", rows.len() - bad.len(), rows.len()),
+            bad.first().copied().unwrap_or("-"),
+            "all",
+            bad.is_empty(),
+        );
+    };
+    kind_row(Checked::Dicom, "DICOM to NIfTI bit-exact with dcm2niix", "series");
+    kind_row(Checked::DicomRefusal, "DICOM series refused with the reason", "series");
+    kind_row(Checked::DicomPixels, "DICOM decoders agree on every syntax", "sets");
     for id in models.keys() {
         let encodes: Vec<(&str, &EncodeReport)> = reports
             .iter()
@@ -786,21 +1033,24 @@ fn print_summary(reports: &[ScanReport], models: &BTreeMap<String, ReferenceMode
     }
     let failed = reports.iter().filter(|r| !r.failures.is_empty()).count();
     let encodes: usize = reports.iter().map(|r| r.encodes.len()).sum();
-    let n_pairs = reports.iter().filter(|r| r.pair).count();
-    let pairs_text = match n_pairs {
+    let count = |checked: Checked| reports.iter().filter(|r| r.checked == checked).count();
+    let n_pairs = count(Checked::Pair);
+    let n_dicom = count(Checked::Dicom) + count(Checked::DicomRefusal) + count(Checked::DicomPixels);
+    let plural = |n: usize, one: &str, many: &str| match n {
         0 => String::new(),
-        1 => "1 pair, ".to_string(),
-        n => format!("{n} pairs, "),
+        1 => format!("1 {one}, "),
+        n => format!("{n} {many}, "),
     };
+    let others = plural(n_pairs, "pair", "pairs") + &plural(n_dicom, "DICOM set", "DICOM sets");
     if failed == 0 {
         println!(
-            "{} {} scans, {pairs_text}{encodes} encodes: every gate passes ({})",
+            "{} {} scans, {others}{encodes} encodes: every gate passes ({})",
             green("✓"),
-            reports.len() - n_pairs,
+            count(Checked::Scan),
             secs(seconds)
         );
     } else {
-        let what = if n_pairs == 0 { "scans" } else { "scans and pairs" };
+        let what = what_was_checked(reports);
         println!("{} {failed} of {} {what} failed ({})", red("✗"), reports.len(), secs(seconds));
         for r in reports.iter().filter(|r| !r.failures.is_empty()) {
             println!("  {}: {}", r.name, r.failures.join("; "));

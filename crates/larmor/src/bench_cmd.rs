@@ -6,17 +6,16 @@ use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use larmor_model::{DeviceChoice, Precision};
-use larmor_volume::Nifti;
 use serde::Serialize;
 
 use crate::cache::{CacheEntry, EntryKey};
 use crate::console::{bold, dim, secs};
-use crate::hashing::sha256_hex;
 use crate::machine::{Load, Machine};
 use crate::model::{self, Model};
 use crate::phantom;
 use crate::pipeline::load_encoder;
 use crate::run_info::{Encoding, RunInfo, StageSeconds, now};
+use crate::scan::{ReadScan, Scan};
 
 /// Options of `larmor bench`.
 pub struct BenchOptions {
@@ -66,7 +65,8 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
     let scratch_dir = tempfile::Builder::new().prefix("larmor-bench").tempdir()?;
     let scratch = scratch_dir.path();
     let (model, model_source) = choose_model(options.model.as_deref(), scratch)?;
-    let (scan, scan_source) = choose_scan(options.scan.as_deref(), scratch)?;
+    let (scan_path, scan_source) = choose_scan(options.scan.as_deref(), scratch)?;
+    let scan = Scan::resolve(&scan_path)?;
     let load = Load::now();
     let start = Instant::now();
     let encoder = load_encoder(&model, options.device, options.precision)?;
@@ -85,12 +85,16 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
     for run in 0..options.runs {
         let mut s = StageSeconds::default();
         let start = Instant::now();
-        let bytes = std::fs::read(&scan)?;
-        let nifti = Nifti::from_bytes(&bytes)?;
-        s.read = start.elapsed().as_secs_f64();
+        let content = scan.read_content()?;
+        let read = start.elapsed().as_secs_f64();
         let start = Instant::now();
-        let sha = sha256_hex(&bytes);
+        let read_scan = ReadScan::new(scan.clone(), content);
+        let sha = read_scan.sha256.clone();
         s.hash = start.elapsed().as_secs_f64();
+        let start = Instant::now();
+        let parsed = read_scan.parse()?;
+        let nifti = parsed.nifti;
+        s.read = read + start.elapsed().as_secs_f64();
         let prepared = model.recipe.run(&nifti)?;
         let t = prepared.timings;
         (s.mask, s.conform, s.quantize, s.normalize) = (
@@ -110,7 +114,17 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
         }
         tokens = encoded.n_tokens;
         let encoding = Encoding::new(&encoder, s.clone(), now());
-        let info = RunInfo::new(&model, encoding, &scan, &sha, &nifti, &prepared, tokens, None)?;
+        let info = RunInfo::new(
+            &model,
+            encoding,
+            scan.path(),
+            &sha,
+            &nifti,
+            parsed.dicom.as_ref(),
+            &prepared,
+            tokens,
+            None,
+        )?;
         let key =
             EntryKey { scan_sha256: &sha, reference_sha256: None, precision: encoder.options().precision };
         let start = Instant::now();
@@ -166,7 +180,7 @@ pub fn cmd_bench(options: BenchOptions) -> Result<()> {
         load,
         model: model.id().to_string(),
         model_source,
-        scan: scan.display().to_string(),
+        scan: scan.display(),
         scan_source,
         device: device.to_string(),
         precision: precision.to_string(),
