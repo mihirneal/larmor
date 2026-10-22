@@ -24,7 +24,7 @@ dir = "~/larmor/derivatives"    # each source's BIDS derivatives go to <dir>/<so
 
 [encode]
 models = ["nanobrain-vits-p8"]  # model ids (see `larmor models`) or paths to model.toml files
-device = "auto"                 # auto, cpu, metal, cuda or cuda:N
+device = "auto"                 # auto (Metal, else the CPU), metal or cpu
 precision = "f32"               # f32, or f16 / bf16 on a GPU
 save_preprocessed = false       # also write the quantized model-grid image and its head mask
 

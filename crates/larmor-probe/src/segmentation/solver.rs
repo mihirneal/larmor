@@ -1,4 +1,4 @@
-//! `probe.py::fit_logistic` solved to its optimum, with the data on a Candle device (Metal, CUDA or CPU).
+//! `probe.py::fit_logistic` solved to its optimum, with the data on a Candle device (Metal or CPU).
 //!
 //! The objective is nanobrain's: mean BCE over all `n x 512` outputs plus `alpha ||W||^2 / (n 512)`, the
 //! intercept unpenalised. Each of the 512 outputs is an independent L2 logistic regression on shared

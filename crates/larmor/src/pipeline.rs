@@ -380,8 +380,8 @@ impl<'a> Pipeline<'a> {
 }
 
 /// Loads a model's encoder on the requested device; [`Encoder::options`] says which device and
-/// precision it got. `auto` picks CUDA, then Metal, then the CPU. Half precision needs a GPU, so
-/// when `auto` finds none it falls back to f32 on the CPU, with a warning.
+/// precision it got. `auto` picks Metal, else the CPU. Half precision needs the GPU, so when
+/// `auto` finds no Metal GPU it falls back to f32 on the CPU, with a warning.
 pub fn load_encoder(model: &Model, device: DeviceChoice, precision: Precision) -> Result<Encoder> {
     let manifest = &model.manifest;
     let loaded = match Encoder::load(manifest, device, precision) {
@@ -394,10 +394,7 @@ pub fn load_encoder(model: &Model, device: DeviceChoice, precision: Precision) -
     };
     loaded.map_err(|err| {
         let hint = match &err {
-            EncoderError::Device(_) => {
-                " (choose another --device, such as metal or cpu, or for CUDA build larmor with --features cuda)"
-                    .to_string()
-            }
+            EncoderError::Device(_) => " (choose another --device, such as metal or cpu)".to_string(),
             EncoderError::Manifest(ManifestError::Checksum { .. } | ManifestError::Read { .. }) => format!(
                 " (run `larmor models verify {id}`, or `larmor models download {id}` if the manifest has a \
                  weights url)",

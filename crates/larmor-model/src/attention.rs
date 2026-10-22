@@ -192,9 +192,8 @@ pub(crate) fn attend(
 /// `softmax(q kᵀ · scale) v` over `[batch, heads, tokens, head_dim]` tensors, `rows` query rows
 /// at a time.
 ///
-/// The softmax runs in the input dtype. Candle's Metal and CUDA softmax kernels accumulate the
-/// sum in f32; its CPU kernel sums in the input dtype, which is why `Encoder` runs only f32 on
-/// the CPU.
+/// The softmax runs in the input dtype. Candle's Metal softmax kernel accumulates the sum in
+/// f32; its CPU kernel sums in the input dtype, which is why `Encoder` runs only f32 on the CPU.
 pub fn chunked_attention(
     q: &Tensor,
     k: &Tensor,

@@ -4,7 +4,7 @@
 //! cargo run --release -p larmor-probe --example segmentation_bench -- fit [--set inner|outer]  # a fit per alpha
 //! cargo run --release -p larmor-probe --example segmentation_bench -- cv         # 5 x 5 x 5 CV + deployable probe
 //! cargo run --release -p larmor-probe --example segmentation_bench -- precision [--alpha 1000]  # f32 gradient error
-//!     [--subjects 300] [--patches 6000] [--dim 384] [--ratio 10] [--positive 0.05] [--device auto|cpu|metal|cuda]
+//!     [--subjects 300] [--patches 6000] [--dim 384] [--ratio 10] [--positive 0.05] [--device auto|cpu|metal]
 //! ```
 //!
 //! Each subject has `--patches` in-mask patches; a `--positive` fraction of them hold a lesion blob of random

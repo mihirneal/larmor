@@ -7,8 +7,8 @@ use safetensors::{Dtype, SafeTensors};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-/// The CPU by default; `LARMOR_TEST_DEVICE=gpu` (or `metal`, `cuda`, `cuda:N`, `auto`) runs the segmentation
-/// tests on that device instead.
+/// The CPU by default; `LARMOR_TEST_DEVICE=gpu` (or `metal`, `auto`) runs the segmentation tests on that
+/// device instead.
 pub fn test_device() -> Device {
     let choice = match std::env::var("LARMOR_TEST_DEVICE") {
         Ok(name) => name.parse().unwrap_or_else(|e| panic!("LARMOR_TEST_DEVICE: {e}")),

@@ -29,8 +29,8 @@ A new probe never re-runs the encoder: it trains on the cache. Only new scans ar
 | `larmor-probe` | Whole-scan and dense linear probes, CV folds, metrics, probe files | `nanobrain.eval.probe`, sklearn |
 | `larmor` | The CLI: encode, cache, outputs, probe fit/apply, watch, check-parity, bench, models ([CLI.md](CLI.md)) | |
 
-The core crates build on macOS (Metal) and Linux (CUDA, the `cuda` feature; not yet built or tested, since
-it needs the CUDA toolkit). Only the future viewer is macOS-only.
+Larmor is macOS-only: it runs on Apple silicon Macs, on the GPU through Metal. The CPU is the fallback
+where Metal is missing (CI runners may not expose it) and runs the tests.
 
 ## Runtime: Candle, not Burn
 
@@ -44,9 +44,9 @@ M3 Ultra Burn was 2–3× slower on Metal, which is the doc's own rule for falli
 
 Burn's other reasons no longer applied: the mask is classical image processing (no Conv3d needed) and the
 probes use analytic gradients (no autodiff). Candle runs fused attention (`candle_nn::ops::sdpa`) on Metal
-and query-chunked attention on the CPU and CUDA. `F16` and `Bf16` are autocast-like: linears, attention and
-GELU in half precision, the residual stream and LayerNorms in f32. Half precision is GPU-only, because
-Candle's CPU f16 matmul accumulates in f16.
+and query-chunked attention on the CPU. `F16` and `Bf16` are autocast-like: linears, attention and GELU in
+half precision, the residual stream and LayerNorms in f32. Half precision is GPU-only, because Candle's CPU
+f16 matmul accumulates in f16.
 
 ## Preprocessing: the `nanobrain-eval` recipe
 
@@ -295,8 +295,7 @@ checkpoints export with `tools/export_checkpoint.py` where they live (the cluste
 ## Embedding cache
 
 Key = `sha256(scan file bytes)` (for a DICOM series, its series SHA-256 above) + the reference scan's sha256
-(multi-modal) + preprocessing version + encoder key + precision (`f32`, `f16`, `bf16`). Location `$LARMOR_CACHE` or `~/Library/Caches/larmor`
-(`$XDG_CACHE_HOME/larmor` on Linux):
+(multi-modal) + preprocessing version + encoder key + precision (`f32`, `f16`, `bf16`). Location `$LARMOR_CACHE` or `~/Library/Caches/larmor`:
 
 ```
 <cache>/<model_id>-<encoder_key8>/<prep_version8>/<precision>/<scan_sha256>[_ref-<reference_sha256>].safetensors

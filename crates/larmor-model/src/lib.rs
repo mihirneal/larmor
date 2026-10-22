@@ -4,9 +4,8 @@
 //! `a1bfdd1`. The encoder is built from the manifest's `[architecture]` alone, so a new model
 //! with supported values is a new `model.toml`, not new code.
 //!
-//! Devices: the CPU always; Metal (Apple GPUs) in macOS builds; CUDA with the `cuda` feature.
-//! Attention uses Candle's fused `sdpa` kernel on Metal and query-chunked attention elsewhere
-//! (see [`attention`]). Typical use:
+//! Devices: the Apple GPU through Metal, or the CPU. Attention uses Candle's fused `sdpa` kernel
+//! on Metal and query-chunked attention elsewhere (see [`attention`]). Typical use:
 //!
 //! ```no_run
 //! use larmor_model::{DeviceChoice, Encoder, Manifest, Precision};

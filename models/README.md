@@ -14,8 +14,7 @@ README; put the weights next to their manifest.
 order, and the first manifest whose `id` matches wins (`<id>.toml` first, then any `.toml` in the folder):
 
 1. every folder in `$LARMOR_MODELS` (colon-separated, like `PATH`),
-2. the user data folder: `~/Library/Application Support/larmor/models` on macOS,
-   `~/.local/share/larmor/models` on Linux,
+2. the user data folder, `~/Library/Application Support/larmor/models`,
 3. `./models` in the current folder (this folder, when you run `larmor` from the repository root).
 
 `larmor models list` prints the folders and every manifest it finds, with the weights status;

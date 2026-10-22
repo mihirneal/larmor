@@ -34,7 +34,7 @@ pub(crate) fn transfer_syntax_problem(transfer_syntax: &str) -> Option<String> {
 }
 
 /// The stored sample bytes of a single-frame image, decompressed and in this machine's byte order
-/// (which Larmor requires to be little-endian, like every Mac and Linux host it builds for).
+/// (which Larmor requires to be little-endian, like every Mac).
 pub(crate) fn sample_bytes(object: &DefaultDicomObject, h: &SliceHeader) -> Result<Vec<u8>, DicomError> {
     let decoded = object.decode_pixel_data().map_err(|e| {
         DicomError::Unsupported(format!(

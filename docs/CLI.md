@@ -5,7 +5,7 @@ applies linear probes on them. This page lists every command, its flags and what
 (recipe, cache, formats, gates).
 
 ```sh
-cargo build --release -p larmor                  # macOS: Metal; Linux + NVIDIA: add --features cuda
+cargo build --release -p larmor                  # Apple silicon Macs; the encoder runs on Metal
 target/release/larmor --help
 ```
 
@@ -17,7 +17,7 @@ Errors print as `error: …` and exit with status 1. Colors turn off when stdout
 | Flag | Meaning |
 |---|---|
 | `--model ID\|PATH` | A model id (looked up as below) or a path to a `model.toml` |
-| `--device auto\|cpu\|metal\|cuda[:N]` | Where the encoder and the segmentation probe run. `auto` (default): CUDA in a `--features cuda` build, else Metal on a Mac, else the CPU |
+| `--device auto\|metal\|cpu` | Where the encoder and the segmentation probe run. `auto` (default): the Metal GPU, else the CPU (where Metal is missing, as on some CI runners) |
 | `--precision f32\|f16\|bf16` | Encoder precision. `f32` (default) is the parity target. `f16` and `bf16` work like PyTorch autocast (linears, attention and GELU in the half type, the residual stream and norms in f32) and need a GPU; with `--device auto` and no GPU, larmor encodes in f32 on the CPU with a warning. The precision is part of the cache key, so an f32 request is never served a half-precision embedding (or the reverse) |
 
 ## Environment
@@ -25,14 +25,14 @@ Errors print as `error: …` and exit with status 1. Colors turn off when stdout
 | Variable | Default | What |
 |---|---|---|
 | `LARMOR_MODELS` | | Colon-separated folders searched first for model ids |
-| `LARMOR_CACHE` | `~/Library/Caches/larmor` (macOS), `$XDG_CACHE_HOME/larmor` or `~/.cache/larmor` (Linux) | Embedding cache |
+| `LARMOR_CACHE` | `~/Library/Caches/larmor` | Embedding cache |
 | `HF_TOKEN` | | Bearer token for `models download` from Hugging Face hosts only (`https://huggingface.co`, `hf.co` and their subdomains, as a URL parser reads the host) |
 | `LARMOR_FIXTURES` | `./fixtures` | Fixtures folder `bench` takes its default scan and model from |
 | `NO_COLOR` | | Plain output |
 
 Model ids are looked up in `$LARMOR_MODELS`, then the user data folder
-(`~/Library/Application Support/larmor/models` on macOS, `~/.local/share/larmor/models` on Linux), then
-`./models`; the first manifest with that `id` wins. See `models/README.md`.
+(`~/Library/Application Support/larmor/models`), then `./models`; the first manifest with that `id` wins.
+See `models/README.md`.
 
 ## `larmor encode <scan or folder>... --model ID`
 
@@ -108,7 +108,7 @@ loaded nanobrain-vits-p8 on metal (f32) in 0.188 s
 
 The hex after the model id is the start of its encoder key. A scan that fails (unreadable, a corrupt or
 4-D header, an empty head mask…) is reported and the others go on; the exit status is 1 if any failed.
-If the encoder cannot be loaded (a weights SHA-256 mismatch, a device this build lacks), the error is
+If the encoder cannot be loaded (a weights SHA-256 mismatch, a device this machine lacks), the error is
 printed once, with what to do, and the remaining uncached scans fail without loading it again.
 
 ### A second modality: `--reference`

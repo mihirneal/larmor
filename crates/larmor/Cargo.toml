@@ -6,10 +6,6 @@ license.workspace = true
 repository.workspace = true
 description = "MRI foundation-model embeddings and linear probes on a Mac, in one Rust program"
 
-[features]
-# NVIDIA GPUs on Linux: `cargo build --release -p larmor --features cuda`
-cuda = ["larmor-model/cuda", "larmor-probe/cuda"]
-
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true

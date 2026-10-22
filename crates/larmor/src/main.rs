@@ -64,8 +64,7 @@ enum Cmd {
 /// Where the encoder runs.
 #[derive(Args, Clone, Copy)]
 struct ComputeArgs {
-    /// auto, cpu, metal, cuda or cuda:N (auto: CUDA when built with it, else Metal on a Mac, else
-    /// the CPU).
+    /// auto, metal or cpu (auto: the Metal GPU when this Mac has one, else the CPU).
     #[arg(long, default_value = "auto")]
     device: DeviceChoice,
     /// Encoder precision: f32 (the parity target), or f16 or bf16 (GPU only, like PyTorch autocast).

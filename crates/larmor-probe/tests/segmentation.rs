@@ -7,7 +7,7 @@
 //!
 //! The fixture tests are `#[ignore]`d because their data lives in `fixtures/` (about 200 MB):
 //! `cargo test -p larmor-probe --release --test segmentation -- --ignored --nocapture`.
-//! Set `LARMOR_TEST_DEVICE=gpu` to run them on the GPU (Metal or CUDA) instead of the CPU.
+//! Set `LARMOR_TEST_DEVICE=gpu` to run them on the GPU (Metal) instead of the CPU.
 
 mod common;
 

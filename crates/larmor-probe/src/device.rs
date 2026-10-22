@@ -1,4 +1,4 @@
-//! The compute device the segmentation probe runs on (Candle: Metal on macOS, CUDA on Linux, or the CPU).
+//! The compute device the segmentation probe runs on (Candle: the Apple GPU through Metal, or the CPU).
 //!
 //! Only the segmentation probe uses a device; the scan-level probes are small and run on the CPU in float64.
 
@@ -6,17 +6,14 @@ use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 
-/// Which device to run on, as a user picks it (`--device auto|cpu|metal|cuda|cuda:N|gpu`).
+/// Which device to run on, as a user picks it (`--device auto|cpu|metal|gpu`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DeviceChoice {
-    /// CUDA device 0 when built with the `cuda` feature, else Metal when this build has it (macOS), else
-    /// the CPU (the same order as `larmor_model::DeviceChoice`).
+    /// Metal when this Mac has it, else the CPU (as `larmor_model::DeviceChoice` picks).
     #[default]
     Auto,
     Cpu,
     Metal,
-    /// A CUDA device by index; needs the `cuda` feature.
-    Cuda(usize),
 }
 
 impl fmt::Display for DeviceChoice {
@@ -25,7 +22,6 @@ impl fmt::Display for DeviceChoice {
             DeviceChoice::Auto => write!(f, "auto"),
             DeviceChoice::Cpu => write!(f, "cpu"),
             DeviceChoice::Metal => write!(f, "metal"),
-            DeviceChoice::Cuda(index) => write!(f, "cuda:{index}"),
         }
     }
 }
@@ -33,21 +29,13 @@ impl fmt::Display for DeviceChoice {
 impl FromStr for DeviceChoice {
     type Err = DeviceError;
 
-    /// Parses `auto`, `cpu`, `metal`, `cuda` (device 0), `cuda:N`, or `gpu` (Metal on macOS, else CUDA 0).
+    /// Parses `auto`, `cpu`, or `metal` (also `gpu`).
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let lower = text.trim().to_ascii_lowercase();
-        match lower.as_str() {
+        match text.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(DeviceChoice::Auto),
             "cpu" => Ok(DeviceChoice::Cpu),
-            "metal" => Ok(DeviceChoice::Metal),
-            "cuda" => Ok(DeviceChoice::Cuda(0)),
-            "gpu" if cfg!(target_os = "macos") => Ok(DeviceChoice::Metal),
-            "gpu" => Ok(DeviceChoice::Cuda(0)),
-            _ => lower
-                .strip_prefix("cuda:")
-                .and_then(|index| index.parse().ok())
-                .map(DeviceChoice::Cuda)
-                .ok_or_else(|| DeviceError::UnknownChoice(text.to_string())),
+            "metal" | "gpu" => Ok(DeviceChoice::Metal),
+            _ => Err(DeviceError::UnknownChoice(text.to_string())),
         }
     }
 }
@@ -55,7 +43,7 @@ impl FromStr for DeviceChoice {
 /// Why a device could not be opened or a computation on it failed.
 #[derive(Debug, Error)]
 pub enum DeviceError {
-    #[error("unknown device {0:?} (expected auto, cpu, metal, cuda or cuda:N)")]
+    #[error("unknown device {0:?} (expected auto, metal or cpu)")]
     UnknownChoice(String),
     #[error("cannot open device {choice}: {reason}")]
     Unavailable { choice: DeviceChoice, reason: String },
@@ -75,8 +63,7 @@ impl Device {
         let opened = match choice {
             DeviceChoice::Auto => return Ok(Self::auto()),
             DeviceChoice::Cpu => Ok(candle_core::Device::Cpu),
-            DeviceChoice::Metal => open_metal(),
-            DeviceChoice::Cuda(index) => open_cuda(index),
+            DeviceChoice::Metal => candle_core::Device::new_metal(0).map_err(|e| e.to_string()),
         };
         opened.map(|inner| Self { inner }).map_err(|reason| DeviceError::Unavailable { choice, reason })
     }
@@ -87,10 +74,7 @@ impl Device {
     }
 
     fn auto() -> Self {
-        [DeviceChoice::Cuda(0), DeviceChoice::Metal]
-            .into_iter()
-            .find_map(|choice| Self::open(choice).ok())
-            .unwrap_or_else(Self::cpu)
+        Self::open(DeviceChoice::Metal).unwrap_or_else(|_| Self::cpu())
     }
 
     /// Wraps a Candle device opened elsewhere (for example the encoder's), so both share it.
@@ -103,7 +87,7 @@ impl Device {
         &self.inner
     }
 
-    /// Whether this is a GPU (Metal or CUDA).
+    /// Whether this is the GPU (Metal).
     pub fn is_gpu(&self) -> bool {
         !self.inner.is_cpu()
     }
@@ -114,31 +98,10 @@ impl Device {
     }
 }
 
-fn open_metal() -> Result<candle_core::Device, String> {
-    if !candle_core::utils::metal_is_available() {
-        return Err("Metal is only built on macOS".into());
-    }
-    candle_core::Device::new_metal(0).map_err(|e| e.to_string())
-}
-
-fn open_cuda(index: usize) -> Result<candle_core::Device, String> {
-    if !candle_core::utils::cuda_is_available() {
-        return Err("larmor-probe was built without the \"cuda\" feature".into());
-    }
-    // cudarc panics, rather than returning an error, when it cannot load the CUDA libraries
-    match std::panic::catch_unwind(|| candle_core::Device::new_cuda(index)) {
-        Ok(opened) => opened.map_err(|e| e.to_string()),
-        Err(_) => Err("the CUDA driver libraries could not be loaded".into()),
-    }
-}
-
 impl fmt::Display for Device {
+    /// `cpu` or `metal`, the only devices Larmor opens.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.inner.location() {
-            candle_core::DeviceLocation::Cpu => write!(f, "cpu"),
-            candle_core::DeviceLocation::Metal { .. } => write!(f, "metal"),
-            candle_core::DeviceLocation::Cuda { gpu_id } => write!(f, "cuda:{gpu_id}"),
-        }
+        f.write_str(if self.inner.is_cpu() { "cpu" } else { "metal" })
     }
 }
 
@@ -150,10 +113,11 @@ mod tests {
     fn parses_device_choices() {
         assert_eq!("auto".parse::<DeviceChoice>().unwrap(), DeviceChoice::Auto);
         assert_eq!("CPU".parse::<DeviceChoice>().unwrap(), DeviceChoice::Cpu);
-        assert_eq!("cuda".parse::<DeviceChoice>().unwrap(), DeviceChoice::Cuda(0));
-        assert_eq!("cuda:2".parse::<DeviceChoice>().unwrap(), DeviceChoice::Cuda(2));
+        assert_eq!("metal".parse::<DeviceChoice>().unwrap(), DeviceChoice::Metal);
+        assert_eq!("gpu".parse::<DeviceChoice>().unwrap(), DeviceChoice::Metal);
+        assert!("cuda".parse::<DeviceChoice>().is_err());
         assert!("tpu".parse::<DeviceChoice>().is_err());
-        assert_eq!(DeviceChoice::Cuda(1).to_string(), "cuda:1");
+        assert_eq!(DeviceChoice::Metal.to_string(), "metal");
     }
 
     #[test]

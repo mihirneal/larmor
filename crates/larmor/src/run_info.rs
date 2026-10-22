@@ -30,7 +30,7 @@ pub struct RunInfo {
     pub tokens: usize,
     /// Embedding width.
     pub width: usize,
-    /// Device the encoder ran on (`metal`, `cpu`, `cuda:0`).
+    /// Device the encoder ran on (`metal` or `cpu`).
     pub device: String,
     /// Encoder matmul precision (`f32`, `f16`, `bf16`).
     pub precision: String,

@@ -4,6 +4,8 @@ One Rust program for Macs that turns an MRI scan into foundation-model embedding
 linear probes on them, in the style of Onset (`~/Developer/onset`). Every number is checked against the
 PyTorch code it mirrors: MedARC-AI/nanobrain's eval framework at commit `a1bfdd1`.
 
+**macOS only.** Larmor runs on Apple silicon Macs with Metal. Don't add Windows or Linux code, docs, or CI.
+
 ## How we work
 
 Claude builds and fixes Larmor directly. The owner is a Rust beginner who knows Python best and knows the
@@ -34,7 +36,8 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
 ## Checks
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-  CI on GitHub runs these on macOS, and builds and tests on Linux.
+  CI on GitHub runs these on macOS. Its runners may not expose Metal, so tests run on the CPU and the ones
+  that need Metal are `#[ignore]`d.
 - Parity (needs `fixtures/`): `cargo test --workspace --release -- --ignored` and
   `target/release/larmor check-parity fixtures` (both reference models and the DICOM sets; exits nonzero if
   any gate fails). Run these after any change to preprocessing, the encoder, the probes or the DICOM reader.
@@ -50,8 +53,9 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
   vs float64 promotion, half-to-even rounding). Against a Linux-built Python stack expect last-bit
   differences. The normalized input differs by one float32 step on 4 of 25 scans because torch's float32
   mean depends on its thread count; Larmor keeps the exactly rounded mean.
-- **Runtime: Candle, not Burn.** Both passed parity; Burn was 2–3× slower on Metal (see DESIGN.md). Fused
-  `sdpa` on Metal, chunked attention elsewhere. `f16`/`bf16` are autocast-like and GPU-only.
+- **Runtime: Candle, not Burn.** Both passed parity; Burn was 2–3× slower on Metal (see DESIGN.md). Devices:
+  Metal (the default) and the CPU (fallback and tests). Fused `sdpa` on Metal, chunked attention elsewhere.
+  `f16`/`bf16` are autocast-like and GPU-only.
 - **Cache:** key = scan bytes SHA-256 (+ the reference scan's for multi-modal input) + recipe `version_hash`
   (includes `larmor_prep::IMPL_VERSION`) + `Manifest::encoder_key` (weights SHA-256, every architecture and
   readout value, `larmor_model::ENCODER_IMPL_VERSION`) + precision. Bump `IMPL_VERSION` whenever a change
@@ -90,9 +94,8 @@ MRI side well (NIfTI, BIDS, preprocessing, foundation models, probes):
 - Not yet: Phase 4 (the egui viewer); enhanced multi-frame DICOM (Philips and Siemens XA export it; the
   dcm_qa_philips_enh and dcm_qa_enh repositories have sets with dcm2niix references) and JPEG-LS (needs
   CharLS, C++).
-- Open: which trained checkpoint ships first (rerun `check-parity` with it); the CUDA build (`--features cuda`)
-  is untested because it needs the CUDA toolkit; check-parity against references made on the cluster; a
-  `watch` trial on the lab's real Box Drive folder (only local folders are tested).
+- Open: which trained checkpoint ships first (rerun `check-parity` with it); check-parity against references
+  made on the cluster; a `watch` trial on the lab's real Box Drive folder (only local folders are tested).
 
 ## Setup on a new Mac
 

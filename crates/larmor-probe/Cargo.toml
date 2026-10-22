@@ -6,10 +6,6 @@ license.workspace = true
 repository.workspace = true
 description = "Whole-scan and dense linear probes with the exact numbers of nanobrain's eval framework"
 
-[features]
-# NVIDIA GPUs (Linux): build with `--features cuda` (needs the CUDA toolkit). Metal is always on for macOS.
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
@@ -19,12 +15,9 @@ toml.workspace = true
 safetensors.workspace = true
 half.workspace = true
 rayon.workspace = true
-candle-core.workspace = true
-candle-nn.workspace = true
+# The segmentation probe runs on Candle: on the Apple GPU through Metal, or on the CPU.
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
 nalgebra = "0.35.0"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { workspace = true, features = ["metal"] }
-candle-nn = { workspace = true, features = ["metal"] }

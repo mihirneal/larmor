@@ -4,7 +4,7 @@
 //! cargo run --release -p larmor-model --example ops_bench -- metal f32 59360 2048
 //! ```
 //!
-//! Arguments: device (`metal`, `cpu`, `cuda`), dtype (`f32`, `f16`, `bf16`), tokens, and chunk
+//! Arguments: device (`metal`, `cpu`), dtype (`f32`, `f16`, `bf16`), tokens, and chunk
 //! rows for the chunked kernel. Heads and head dim are ViT-S's, 6 × 64.
 
 use std::time::Instant;

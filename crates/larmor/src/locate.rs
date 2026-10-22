@@ -9,16 +9,15 @@ use rayon::prelude::*;
 use crate::scan::Scan;
 
 /// Directories searched for `model.toml` files by id, in order: each entry of `$LARMOR_MODELS`
-/// (colon-separated), the user data directory (`~/Library/Application Support/larmor/models` on
-/// macOS, `~/.local/share/larmor/models` on Linux), then `./models`. A folder named twice is
-/// searched once.
+/// (colon-separated), the user's `~/Library/Application Support/larmor/models`, then `./models`.
+/// A folder named twice is searched once.
 pub fn model_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(list) = std::env::var_os("LARMOR_MODELS") {
         dirs.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
     }
-    if let Some(data) = dirs::data_dir() {
-        dirs.push(data.join("larmor").join("models"));
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Library/Application Support/larmor/models"));
     }
     dirs.push(PathBuf::from("models"));
     let mut seen = std::collections::HashSet::new();
@@ -26,14 +25,13 @@ pub fn model_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// The embedding cache root: `$LARMOR_CACHE`, else `~/Library/Caches/larmor` on macOS
-/// (`$XDG_CACHE_HOME/larmor` or `~/.cache/larmor` on Linux).
+/// The embedding cache root: `$LARMOR_CACHE`, else `~/Library/Caches/larmor`.
 pub fn cache_root() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("LARMOR_CACHE").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
-    let base = dirs::cache_dir().context("no cache directory on this system; set LARMOR_CACHE")?;
-    Ok(base.join("larmor"))
+    let home = dirs::home_dir().context("no home folder for the cache; set LARMOR_CACHE")?;
+    Ok(home.join("Library/Caches/larmor"))
 }
 
 /// True for `.nii` and `.nii.gz` file names (any case).

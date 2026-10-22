@@ -14,7 +14,7 @@
 //! Each case runs `--warmup` untimed encodes (the first also compiles GPU kernels), then `--runs`
 //! timed ones, and reports their median. A time is one whole `Encoder::encode`: upload, forward
 //! pass and readback. Next to each time is the machine's load when the case started: GPU
-//! utilization (macOS, from `ioreg`) and the 1-minute CPU load average. Memory is the peak of
+//! utilization (from `ioreg`) and the 1-minute CPU load average. Memory is the peak of
 //! the Metal allocation during the timed runs (weights, activations and Candle's buffer pool),
 //! or the process's peak resident set on other devices.
 
@@ -38,7 +38,7 @@ struct Args {
     /// Fixtures directory.
     #[arg(long, env = "LARMOR_FIXTURES", default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures"))]
     fixtures: PathBuf,
-    /// Comma-separated devices: auto, cpu, metal or cuda[:N].
+    /// Comma-separated devices: auto, cpu or metal.
     #[arg(long, value_delimiter = ',', default_value = "auto")]
     devices: Vec<DeviceChoice>,
     /// Comma-separated precisions: f32, f16, bf16.
@@ -285,7 +285,7 @@ fn median(sorted: &[f64]) -> f64 {
     if sorted.len().is_multiple_of(2) { (sorted[mid - 1] + sorted[mid]) / 2.0 } else { sorted[mid] }
 }
 
-/// GPU utilization in percent, from the IOAccelerator's performance statistics (macOS only).
+/// GPU utilization in percent, from the IOAccelerator's performance statistics.
 fn gpu_utilization() -> Option<u32> {
     let output = Command::new("ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]).output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -328,7 +328,6 @@ fn max_rss_bytes() -> u64 {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
         usage.assume_init()
     };
-    let max_rss = usage.ru_maxrss.max(0) as u64;
-    // macOS reports bytes, Linux kibibytes
-    if cfg!(target_os = "macos") { max_rss } else { max_rss * 1024 }
+    // in bytes on macOS
+    usage.ru_maxrss.max(0) as u64
 }

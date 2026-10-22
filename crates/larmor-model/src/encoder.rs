@@ -150,7 +150,6 @@ impl Encoder {
     /// is about the weights alone; poll it during an encode to see the peak.
     pub fn device_memory_reserved(&self) -> Option<u64> {
         match &self.device {
-            #[cfg(target_os = "macos")]
             Device::Metal(metal) => Some(metal.current_allocated_size() as u64),
             _ => None,
         }

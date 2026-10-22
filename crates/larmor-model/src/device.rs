@@ -1,15 +1,14 @@
 //! Picking a Candle device and a compute precision.
 //!
-//! Which devices exist depends on the build:
+//! Larmor runs on Apple silicon Macs. The encoder runs on the GPU through Metal, or on the CPU: the
+//! fallback where Metal is missing (CI runners may not expose it) and what the tests use.
 //!
-//! | Device | Built | Attention kernel |
-//! |---|---|---|
-//! | [`DeviceChoice::Cpu`] | always | query-chunked |
-//! | [`DeviceChoice::Metal`] | on macOS | fused `sdpa` (query-chunked for head dims it lacks) |
-//! | [`DeviceChoice::Cuda`] | with the `cuda` feature | query-chunked |
+//! | Device | Attention kernel |
+//! |---|---|
+//! | [`DeviceChoice::Metal`] | fused `sdpa` (query-chunked for head dims it lacks) |
+//! | [`DeviceChoice::Cpu`] | query-chunked |
 
 use std::fmt;
-use std::panic;
 use std::str::FromStr;
 
 use candle_core::{DType, Device};
@@ -19,15 +18,13 @@ use crate::error::EncoderError;
 /// Which compute device runs the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceChoice {
-    /// The best device this build and machine have: CUDA, then Metal, then the CPU.
+    /// Metal when this Mac has it, else the CPU.
     #[default]
     Auto,
     /// The CPU.
     Cpu,
     /// The Apple GPU, through Metal.
     Metal,
-    /// An NVIDIA GPU, by index.
-    Cuda(usize),
 }
 
 /// Numeric precision of the encoder.
@@ -46,7 +43,7 @@ pub enum DeviceChoice {
 /// PyTorch's own bf16 autocast does (6.0e-5). Mixed f16 is also closer (1.0e-6 against 1.8e-6),
 /// and an f32 residual stream cannot overflow f16's ±65504 range between blocks.
 ///
-/// Half precision needs a GPU (Metal or CUDA). Candle's CPU backend has no bf16 matmul, and on
+/// Half precision needs the GPU (Metal). Candle's CPU backend has no bf16 matmul, and on
 /// Apple silicon its f16 matmuls and softmax accumulate in f16: ViT-S patch 8 then reaches a min
 /// token cosine of only 0.87 against PyTorch fp32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,7 +103,6 @@ impl fmt::Display for DeviceChoice {
             DeviceChoice::Auto => f.write_str("auto"),
             DeviceChoice::Cpu => f.write_str("cpu"),
             DeviceChoice::Metal => f.write_str("metal"),
-            DeviceChoice::Cuda(index) => write!(f, "cuda:{index}"),
         }
     }
 }
@@ -115,16 +111,11 @@ impl FromStr for DeviceChoice {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.to_ascii_lowercase();
-        match s.as_str() {
+        match s.to_ascii_lowercase().as_str() {
             "auto" => Ok(DeviceChoice::Auto),
             "cpu" => Ok(DeviceChoice::Cpu),
             "metal" => Ok(DeviceChoice::Metal),
-            "cuda" => Ok(DeviceChoice::Cuda(0)),
-            _ => match s.strip_prefix("cuda:").map(str::parse) {
-                Some(Ok(index)) => Ok(DeviceChoice::Cuda(index)),
-                _ => Err(format!("unknown device {s:?} (expected auto, cpu, metal or cuda[:N])")),
-            },
+            other => Err(format!("unknown device {other:?} (expected auto, metal or cpu)")),
         }
     }
 }
@@ -144,33 +135,14 @@ impl DeviceChoice {
         self.open().map(|(_, device)| device)
     }
 
-    /// Open the device, resolving `Auto` to the first of CUDA, Metal and CPU that works.
+    /// Open the device, resolving `Auto` to Metal if it opens, else the CPU.
     pub fn open(self) -> Result<(DeviceChoice, Device), EncoderError> {
         match self {
-            DeviceChoice::Auto => {
-                let gpu = [DeviceChoice::Cuda(0), DeviceChoice::Metal]
-                    .into_iter()
-                    .find_map(|choice| choice.open().ok());
-                Ok(gpu.unwrap_or((DeviceChoice::Cpu, Device::Cpu)))
-            }
+            DeviceChoice::Auto => Ok(DeviceChoice::Metal.open().unwrap_or((DeviceChoice::Cpu, Device::Cpu))),
             DeviceChoice::Cpu => Ok((self, Device::Cpu)),
             DeviceChoice::Metal => match Device::new_metal(0) {
                 Ok(device) => Ok((self, device)),
-                Err(_) if !cfg!(target_os = "macos") => Err(EncoderError::Device(
-                    "Metal is only available in macOS builds of larmor-model".into(),
-                )),
                 Err(err) => Err(EncoderError::Device(format!("no Metal GPU: {err}"))),
-            },
-            // cudarc panics, rather than returning an error, when it cannot load the CUDA libraries
-            DeviceChoice::Cuda(index) => match panic::catch_unwind(|| Device::new_cuda(index)) {
-                Ok(Ok(device)) => Ok((self, device)),
-                Ok(Err(_)) if !cfg!(feature = "cuda") => {
-                    Err(EncoderError::Device("larmor-model was built without the \"cuda\" feature".into()))
-                }
-                Ok(Err(err)) => Err(EncoderError::Device(format!("CUDA device {index}: {err}"))),
-                Err(_) => Err(EncoderError::Device(format!(
-                    "CUDA device {index}: the CUDA driver libraries could not be loaded"
-                ))),
             },
         }
     }
@@ -181,13 +153,9 @@ impl DeviceChoice {
     }
 }
 
-/// The [`DeviceChoice`] a Candle device corresponds to.
+/// The [`DeviceChoice`] a Candle device corresponds to. Larmor opens only Metal and the CPU.
 pub(crate) fn choice_of(device: &Device) -> DeviceChoice {
-    match device.location() {
-        candle_core::DeviceLocation::Cpu => DeviceChoice::Cpu,
-        candle_core::DeviceLocation::Metal { .. } => DeviceChoice::Metal,
-        candle_core::DeviceLocation::Cuda { gpu_id } => DeviceChoice::Cuda(gpu_id),
-    }
+    if device.is_cpu() { DeviceChoice::Cpu } else { DeviceChoice::Metal }
 }
 
 #[cfg(test)]
@@ -196,13 +164,14 @@ mod tests {
 
     #[test]
     fn names_round_trip() {
-        for choice in [DeviceChoice::Auto, DeviceChoice::Cpu, DeviceChoice::Metal, DeviceChoice::Cuda(1)] {
+        for choice in [DeviceChoice::Auto, DeviceChoice::Cpu, DeviceChoice::Metal] {
             assert_eq!(choice.to_string().parse::<DeviceChoice>(), Ok(choice));
         }
         for precision in [Precision::F32, Precision::F16, Precision::Bf16] {
             assert_eq!(precision.to_string().parse::<Precision>(), Ok(precision));
         }
-        assert_eq!("cuda".parse::<DeviceChoice>(), Ok(DeviceChoice::Cuda(0)));
+        assert_eq!("Metal".parse::<DeviceChoice>(), Ok(DeviceChoice::Metal));
+        assert!("cuda".parse::<DeviceChoice>().is_err());
         assert!("wgpu".parse::<DeviceChoice>().is_err());
     }
 
