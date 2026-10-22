@@ -22,11 +22,28 @@ A new probe never re-runs the encoder: it trains on the cache. Only new scans ar
 |---|---|---|
 | `larmor-volume` | NIfTI I/O, affines, orientation, resampling, Gaussian filter, morphology, quantiles | nibabel, scipy.ndimage, numpy |
 | `larmor-prep` | Preprocessing recipes built from those ops; patchify and tokens | `nanobrain.eval.preprocessing`, `eval/prepare.py::prepare_images`, `ViTMAE3D.dense_embed` |
-| `larmor-model` | `model.toml` manifests, safetensors weights, the 3D ViT encoder on Burn | `nanobrain.model.ViTMAE3D`, `nanobrain.modules` |
+| `larmor-model` | `model.toml` manifests, safetensors weights, the 3D ViT encoder on Candle | `nanobrain.model.ViTMAE3D`, `nanobrain.modules` |
 | `larmor-probe` | Whole-scan and dense linear probes, CV folds, metrics, probe files | `nanobrain.eval.probe`, sklearn |
-| `larmor` | The CLI: encode, cache, outputs, probe fit/apply, check-parity, bench, models | |
+| `larmor` | The CLI: encode, cache, outputs, probe fit/apply, check-parity, bench, models ([CLI.md](CLI.md)) | |
 
-The core crates build on macOS (Metal) and Linux (CUDA). Only the future viewer is macOS-only.
+The core crates build on macOS (Metal) and Linux (CUDA, the `cuda` feature; not yet built or tested, since
+it needs the CUDA toolkit). Only the future viewer is macOS-only.
+
+## Runtime: Candle, not Burn
+
+The Phase 0 spike built the encoder on both. Both passed parity (f32 min token cosine 1 − 1e-12), but on an
+M3 Ultra Burn was 2–3× slower on Metal, which is the doc's own rule for falling back to Candle:
+
+| ViT-S, Metal, one scan | Burn | Candle | PyTorch MPS |
+|---|---|---|---|
+| patch 8 (8,150 tokens), f32 / f16 | 0.30 s / 0.20 s | 0.16 s / 0.14 s | 0.135 s / 0.11 s |
+| patch 4 (59,359 tokens), f32 / f16 | 13–20 s / 13 s | 5.4 s / 4.1 s | 6.3 s / 5.5 s |
+
+Burn's other reasons no longer applied: the mask is classical image processing (no Conv3d needed) and the
+probes use analytic gradients (no autodiff). Candle runs fused attention (`candle_nn::ops::sdpa`) on Metal
+and query-chunked attention on the CPU and CUDA. `F16` and `Bf16` are autocast-like: linears, attention and
+GELU in half precision, the residual stream and LayerNorms in f32. Half precision is GPU-only, because
+Candle's CPU f16 matmul accumulates in f16.
 
 ## Preprocessing: the `nanobrain-eval` recipe
 
