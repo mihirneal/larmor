@@ -5,12 +5,21 @@
 //! property would produce embeddings that look fine and are wrong.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::error::ManifestError;
+
+/// Version of this crate's encoder numerics, part of [`Manifest::encoder_key`] and so of every
+/// cache key. Bump it whenever a change could move any encoder output for some manifest
+/// (attention, GELU, LayerNorm, the half-precision autocast path, the readout).
+pub const ENCODER_IMPL_VERSION: &str = "1";
+
+/// Longest model id accepted (it becomes part of folder and file names).
+const MAX_ID_LEN: usize = 64;
 
 /// A parsed and validated `model.toml`.
 ///
@@ -18,7 +27,9 @@ use crate::error::ManifestError;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
-    /// Model id, what `--model` takes (e.g. `nanobrain-vits-p8`).
+    /// Model id, what `--model` takes (e.g. `nanobrain-vits-p8`). Letters, digits, `.`, `_` and
+    /// `-`, starting with a letter or digit, at most 64 characters: it becomes part of cache folder
+    /// and output file names.
     pub id: String,
     /// Architecture family; only `vit3d` exists today.
     pub family: String,
@@ -43,7 +54,7 @@ pub struct Manifest {
 }
 
 /// `[architecture]`: the ViT hyperparameters, as in `nanobrain.model.ViTMAE3D.__init__`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Architecture {
     /// Input grid in voxels, `[X, Y, Z]`.
@@ -75,7 +86,7 @@ pub struct Architecture {
 }
 
 /// `[readout]`: which tokens are the embedding and how they are pooled.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Readout {
     /// `last`: the last block's output after the final norm.
@@ -88,7 +99,8 @@ pub struct Readout {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Weights {
-    /// File name, relative to the manifest.
+    /// A plain file name, in the manifest's folder (no `/`, `..` or absolute path, so neither
+    /// loading nor `models download` touches anything outside that folder).
     pub file: String,
     /// Lower-case hex SHA-256 of the file.
     pub sha256: String,
@@ -134,6 +146,26 @@ impl Manifest {
         self.dir.join(&self.weights.file)
     }
 
+    /// What decides the encoder's output for a given input, as a hex SHA-256: the weights' SHA-256
+    /// and tensor naming, `family`, every `[architecture]` and `[readout]` value, and
+    /// [`ENCODER_IMPL_VERSION`].
+    ///
+    /// Fields such as `heads` and `norm_eps` change the forward pass without changing any weight
+    /// shape, so the weights' checksum alone does not identify the embeddings; caches and probes
+    /// key on this instead. It is the SHA-256 of the canonical JSON (sorted keys, no whitespace)
+    /// of those values; the id, description, weights file name and URL, and `[source]` are left
+    /// out because they do not change the numbers.
+    pub fn encoder_key(&self) -> String {
+        let doc = serde_json::json!({
+            "impl_version": ENCODER_IMPL_VERSION,
+            "family": self.family,
+            "architecture": self.architecture,
+            "readout": self.readout,
+            "weights": { "sha256": self.weights.sha256.to_ascii_lowercase(), "naming": self.weights.naming },
+        });
+        sha256_hex(canonical_json(&doc).as_bytes())
+    }
+
     /// Read the weights file and check its SHA-256 against the manifest. Returns the file bytes so
     /// callers that go on to load the tensors read the file only once.
     pub fn read_verified_weights(&self) -> Result<Vec<u8>, ManifestError> {
@@ -152,6 +184,7 @@ impl Manifest {
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
+        validate_id(&self.id)?;
         expect_one_of("family", &self.family, &["vit3d"])?;
         self.architecture.validate()?;
         expect_one_of("readout.tokens", &self.readout.tokens, &["last"])?;
@@ -161,9 +194,7 @@ impl Manifest {
         if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(invalid("weights.sha256", format!("{sha:?} is not a 64-digit hex SHA-256")));
         }
-        if self.weights.file.is_empty() {
-            return Err(invalid("weights.file", "is empty".to_string()));
-        }
+        validate_file_name(&self.weights.file)?;
         for (i, step) in self.preprocessing.steps.iter().enumerate() {
             if !matches!(step.get("op"), Some(toml::Value::String(_))) {
                 return Err(invalid(
@@ -240,6 +271,64 @@ impl Architecture {
             return Err(invalid("architecture.grid", "patch grid does not fit u16 coordinates".into()));
         }
         Ok(())
+    }
+}
+
+/// A model id is a folder and file name part: `[A-Za-z0-9][A-Za-z0-9._-]*`, at most 64
+/// characters, without `..`.
+fn validate_id(id: &str) -> Result<(), ManifestError> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let ok = id.len() <= MAX_ID_LEN
+        && id.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && id.chars().all(allowed)
+        && !id.contains("..");
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(
+            "id",
+            format!(
+                "{id:?} must be 1 to {MAX_ID_LEN} letters, digits, '.', '_' or '-', starting with a letter or \
+                 digit, without '..' (it names cache folders and output files); for a Hugging Face style \
+                 name write org--name or org_name instead of org/name"
+            ),
+        ))
+    }
+}
+
+/// `weights.file` must name a file in the manifest's own folder: one plain path component.
+fn validate_file_name(file: &str) -> Result<(), ManifestError> {
+    let mut components = Path::new(file).components();
+    let plain = matches!((components.next(), components.next()), (Some(Component::Normal(_)), None))
+        && !file.contains(['/', '\\']);
+    if plain {
+        Ok(())
+    } else {
+        Err(invalid(
+            "weights.file",
+            format!(
+                "{file:?} must be a plain file name in the manifest's folder (no '/', '..' or absolute path)"
+            ),
+        ))
+    }
+}
+
+/// JSON text with object keys sorted and no whitespace, independent of serde_json's map order.
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}:{}", Value::String((*k).clone()), canonical_json(&map[*k])))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        Value::Array(items) => {
+            format!("[{}]", items.iter().map(canonical_json).collect::<Vec<_>>().join(","))
+        }
+        other => other.to_string(),
     }
 }
 

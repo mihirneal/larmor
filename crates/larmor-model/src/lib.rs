@@ -33,4 +33,6 @@ pub use attention::{AttentionKernel, AttentionOptions};
 pub use device::{DeviceChoice, Precision};
 pub use encoder::{Encoded, Encoder, EncoderOptions};
 pub use error::{EncoderError, ManifestError};
-pub use manifest::{Architecture, Manifest, Preprocessing, Readout, Weights, sha256_hex};
+pub use manifest::{
+    Architecture, ENCODER_IMPL_VERSION, Manifest, Preprocessing, Readout, Weights, sha256_hex,
+};

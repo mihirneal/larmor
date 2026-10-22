@@ -96,6 +96,46 @@ fn manifest_rejects_inconsistent_shapes() {
 }
 
 #[test]
+fn manifest_ids_and_weight_files_cannot_leave_their_folders() {
+    for bad in ["a/b", "../x", ".", "..", "", "a\\\\b", "-x", "medarc/vits-p8", "a..b", &"x".repeat(65)] {
+        let err = parse_edited("id = \"tiny-vit\"", &format!("id = {bad:?}")).unwrap_err();
+        assert!(matches!(&err, ManifestError::Invalid { field, .. } if field == "id"), "{bad:?}: {err:?}");
+    }
+    for good in ["nanobrain-vits-p8-ref", "nanobrain_vits.p8", "medarc--vits-p8", "A1"] {
+        assert_eq!(parse_edited("id = \"tiny-vit\"", &format!("id = {good:?}")).unwrap().id, good);
+    }
+    let file = "file = \"tiny-vit.safetensors\"";
+    for bad in
+        ["../x.safetensors", "a/../../x", "/etc/x", "~/.zshrc", "sub/x.safetensors", "..", ".", "", "a\\\\b"]
+    {
+        let err = parse_edited(file, &format!("file = {bad:?}")).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Invalid { field, .. } if field == "weights.file"),
+            "{bad:?}: {err:?}"
+        );
+    }
+    assert!(parse_edited(file, "file = \"weights v2.safetensors\"").is_ok());
+}
+
+#[test]
+fn encoder_key_covers_every_output_changing_field() {
+    let base = tiny_manifest().encoder_key();
+    assert_eq!(base.len(), 64);
+    assert_eq!(parse_edited("description = \"", "description = \"other ").unwrap().encoder_key(), base);
+    assert_eq!(parse_edited("id = \"tiny-vit\"", "id = \"renamed\"").unwrap().encoder_key(), base);
+    assert_eq!(parse_edited("url = \"\"", "url = \"https://example.org/w\"").unwrap().encoder_key(), base);
+    for (from, to) in [
+        ("heads = 4", "heads = 8"),
+        ("norm_eps = 1e-06", "norm_eps = 1e-05"),
+        ("sha256 = \"29c7", "sha256 = \"39c7"),
+        ("mlp_ratio = 4.0", "mlp_ratio = 2.0"),
+        ("qkv_bias = true", "qkv_bias = false"),
+    ] {
+        assert_ne!(parse_edited(from, to).unwrap().encoder_key(), base, "{to}");
+    }
+}
+
+#[test]
 fn manifest_rejects_unknown_keys() {
     let err = parse_edited("qkv_bias = true", "qkv_bias = true\nqkv_bais = true").unwrap_err();
     assert!(matches!(err, ManifestError::Parse(_)), "{err:?}");
